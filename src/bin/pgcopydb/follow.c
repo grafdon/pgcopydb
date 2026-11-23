@@ -1204,3 +1204,308 @@ follow_wait_pid(pid_t subprocess, bool *exited, int *returnCode, int *sig)
 
 	return true;
 }
+
+
+/* a partition family, or a table outside any partition tree */
+typedef struct WalWorkerUnit
+{
+	uint32_t family;
+	int64_t weight;
+	int64_t bytes;
+	int tables;
+	int worker;
+} WalWorkerUnit;
+
+typedef struct WalWorkerLoad
+{
+	int64_t weight;
+	int64_t bytes;
+	int units;
+} WalWorkerLoad;
+
+
+static int
+wal_workers_compare_family(const void *a, const void *b)
+{
+	uint32_t fa = ((const WalWorkerUnit *) a)->family;
+	uint32_t fb = ((const WalWorkerUnit *) b)->family;
+
+	return fa < fb ? -1 : fa > fb ? 1 : 0;
+}
+
+
+/* heaviest first; the family oid makes the order total */
+static int
+wal_workers_compare_weight(const void *a, const void *b)
+{
+	const WalWorkerUnit *ua = *(WalWorkerUnit *const *) a;
+	const WalWorkerUnit *ub = *(WalWorkerUnit *const *) b;
+
+	if (ua->weight != ub->weight)
+	{
+		return ua->weight > ub->weight ? -1 : 1;
+	}
+
+	if (ua->bytes != ub->bytes)
+	{
+		return ua->bytes > ub->bytes ? -1 : 1;
+	}
+
+	if (ua->tables != ub->tables)
+	{
+		return ua->tables > ub->tables ? -1 : 1;
+	}
+
+	return wal_workers_compare_family(ua, ub);
+}
+
+
+/* units are sorted by family and every table's family is among them */
+static WalWorkerUnit *
+wal_workers_find_unit(WalWorkerUnit *units, int count, uint32_t family)
+{
+	int lo = 0;
+	int hi = count - 1;
+
+	while (lo <= hi)
+	{
+		int mid = lo + (hi - lo) / 2;
+
+		if (units[mid].family == family)
+		{
+			return &(units[mid]);
+		}
+
+		if (units[mid].family < family)
+		{
+			lo = mid + 1;
+		}
+		else
+		{
+			hi = mid - 1;
+		}
+	}
+
+	return NULL;
+}
+
+
+static void
+wal_workers_add_load(WalWorkerLoad *load, WalWorkerUnit *unit, int worker)
+{
+	unit->worker = worker;
+	load[worker].weight += unit->weight;
+	load[worker].bytes += unit->bytes;
+	load[worker].units++;
+}
+
+
+/*
+ * wal_workers_assign_units places the high-traffic units, then the others
+ * greedily. units must be sorted by family, order has room for every unit.
+ */
+static bool
+wal_workers_assign_units(WalWorkerTable *tables, int count,
+						 WalWorkerUnit *units, int unitCount,
+						 WalWorkerUnit **order,
+						 int workers, const char *highTraffic)
+{
+	WalWorkerLoad load[MAX_WAL_WORKERS] = { 0 };
+	const char *entries[MAX_WAL_WORKERS] = { 0 };
+	int lengths[MAX_WAL_WORKERS] = { 0 };
+	int h = 0;
+
+	bool empty = highTraffic == NULL || *highTraffic == '\0';
+
+	for (const char *entry = empty ? NULL : highTraffic; entry != NULL;)
+	{
+		const char *comma = strchr(entry, ',');
+		int len = comma == NULL ? (int) strlen(entry) : (int) (comma - entry);
+
+		if (h == workers)
+		{
+			log_error("Option --wal-high-traffic-tables lists more tables "
+					  "than --wal-workers %d",
+					  workers);
+			return false;
+		}
+
+		const char *dot = memchr(entry, '.', len);
+		size_t nsplen = dot == NULL ? 0 : (size_t) (dot - entry);
+		const char *rel = dot == NULL ? NULL : dot + 1;
+		size_t rellen = dot == NULL ? 0 : (size_t) (entry + len - rel);
+		WalWorkerTable *match = NULL;
+		int matches = 0;
+
+		for (int i = 0; dot != NULL && i < count; i++)
+		{
+			if (strlen(tables[i].nspname) == nsplen &&
+				strncmp(tables[i].nspname, entry, nsplen) == 0 &&
+				strlen(tables[i].relname) == rellen &&
+				strncmp(tables[i].relname, rel, rellen) == 0)
+			{
+				match = &(tables[i]);
+				++matches;
+			}
+		}
+
+		if (matches != 1)
+		{
+			log_error("Option --wal-high-traffic-tables entry \"%.*s\" "
+					  "matches %d published tables, expected exactly one",
+					  len, entry, matches);
+			return false;
+		}
+
+		WalWorkerUnit *unit = wal_workers_find_unit(units, unitCount,
+													match->family);
+
+		if (unit->worker != -1)
+		{
+			int other = unit->worker;
+
+			log_error("Option --wal-high-traffic-tables entries \"%.*s\" and "
+					  "\"%.*s\" are in the same partition family",
+					  lengths[other], entries[other], len, entry);
+			return false;
+		}
+
+		entries[h] = entry;
+		lengths[h] = len;
+		wal_workers_add_load(load, unit, h);
+		++h;
+
+		entry = comma == NULL ? NULL : comma + 1;
+	}
+
+	int orderCount = 0;
+
+	for (int i = 0; i < unitCount; i++)
+	{
+		if (units[i].worker == -1)
+		{
+			order[orderCount++] = &(units[i]);
+		}
+	}
+
+	if (orderCount > 1)
+	{
+		qsort(order, orderCount, sizeof(WalWorkerUnit *), /* IGNORE-BANNED */
+			  wal_workers_compare_weight);
+	}
+
+	int first = h < workers ? h : 0;
+
+	for (int i = 0; i < orderCount; i++)
+	{
+		int best = first;
+
+		for (int w = first + 1; w < workers; w++)
+		{
+			WalWorkerLoad *a = &(load[w]);
+			WalWorkerLoad *b = &(load[best]);
+
+			if (a->weight < b->weight ||
+				(a->weight == b->weight &&
+				 (a->bytes < b->bytes ||
+				  (a->bytes == b->bytes && a->units < b->units))))
+			{
+				best = w;
+			}
+		}
+
+		wal_workers_add_load(load, order[i], best);
+	}
+
+	for (int w = 0; w < workers; w++)
+	{
+		if (load[w].units == 0)
+		{
+			log_error("Failed to assign a table to WAL worker %d: "
+					  "%d workers for %d published tables in %d partition "
+					  "families or single tables",
+					  w, workers, count, unitCount);
+			return false;
+		}
+	}
+
+	for (int i = 0; i < count; i++)
+	{
+		tables[i].worker =
+			wal_workers_find_unit(units, unitCount, tables[i].family)->worker;
+	}
+
+	return true;
+}
+
+
+/*
+ * wal_workers_assign sets the worker of every table, the same way for any
+ * input order. A partition family is one unit, high-traffic units go to
+ * workers 0 to H-1, the others heaviest first to the least-loaded worker.
+ */
+bool
+wal_workers_assign(WalWorkerTable *tables, int count, int workers,
+				   const char *highTraffic)
+{
+	if (workers < 1 || workers > MAX_WAL_WORKERS || count < 0)
+	{
+		log_error("BUG: wal_workers_assign called with %d workers "
+				  "and %d tables",
+				  workers, count);
+		return false;
+	}
+
+	/* one more slot keeps calloc away from a zero size */
+	WalWorkerUnit *units = calloc(count + 1, sizeof(WalWorkerUnit));
+	WalWorkerUnit **order = calloc(count + 1, sizeof(WalWorkerUnit *));
+
+	if (units == NULL || order == NULL)
+	{
+		log_error(ALLOCATION_FAILED_ERROR);
+		free(units);
+		free(order);
+		return false;
+	}
+
+	for (int i = 0; i < count; i++)
+	{
+		units[i].family = tables[i].family;
+	}
+
+	if (count > 1)
+	{
+		qsort(units, count, sizeof(WalWorkerUnit), /* IGNORE-BANNED */
+			  wal_workers_compare_family);
+	}
+
+	int unitCount = 0;
+
+	for (int i = 0; i < count; i++)
+	{
+		if (unitCount == 0 || units[unitCount - 1].family != units[i].family)
+		{
+			units[unitCount++] = (WalWorkerUnit) {
+				.family = units[i].family, .worker = -1
+			};
+		}
+	}
+
+	for (int i = 0; i < count; i++)
+	{
+		WalWorkerUnit *unit =
+			wal_workers_find_unit(units, unitCount, tables[i].family);
+
+		unit->weight += tables[i].weight;
+		unit->bytes += tables[i].bytes;
+		unit->tables++;
+	}
+
+	bool success = wal_workers_assign_units(tables, count, units, unitCount,
+											order, workers, highTraffic);
+
+	free(units);
+	free(order);
+
+	return success;
+}

@@ -17,6 +17,7 @@ all: pagila pagila-multi-steps blobs unit filtering extensions \
 	 cdc-receive-drain-error cdc-receive-reconnect-dying-source \
 	 cdc-receive-status-interval cdc-apply-wakeup catalog-stmt-cache \
 	 cdc-receive-group-commit cdc-endpos-before-txn cdc-wal-workers \
+	 wal-workers-assign \
 	 follow-wal2json follow-9.6 follow-data-only \
 	 follow-pgoutput follow-filtering follow-resume-snapshot \
 	 orphaned-target-backend split-table-resume \
@@ -144,6 +145,10 @@ cdc-endpos-before-txn: build
 catalog-stmt-cache:
 	$(MAKE) -C $@
 
+# builds its own image from the build stage of the top-level Dockerfile
+wal-workers-assign:
+	$(MAKE) -C $@
+
 follow-pgoutput: build
 	$(MAKE) -C $@
 
@@ -220,6 +225,7 @@ clean-images:
 .PHONY: cdc-truncate-multi cdc-copy-multi-insert cdc-origin-abort cdc-receive-drain-error
 .PHONY: cdc-receive-reconnect-dying-source cdc-receive-status-interval cdc-apply-wakeup
 .PHONY: catalog-stmt-cache cdc-receive-group-commit cdc-endpos-before-txn cdc-wal-workers
+.PHONY: wal-workers-assign
 .PHONY: follow-wal2json follow-9.6 follow-resume-snapshot orphaned-target-backend split-table-resume
 .PHONY: all-databases-resume large-objects-resume json-logs
 .PHONY: defer-indexes defer-indexes-queue defer-indexes-all-databases

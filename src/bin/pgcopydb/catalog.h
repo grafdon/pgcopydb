@@ -83,6 +83,39 @@ bool catalog_read_replication_slot(DatabaseCatalog *catalog,
 								   ReplicationSlot *slot);
 bool catalog_open_for_slot(const char *dbfile, DatabaseCatalog *catalog);
 
+/* family is the partition root oid, or the table's own oid */
+typedef struct WalWorkerTable
+{
+	uint32_t oid;
+	char nspname[NAMEDATALEN];
+	char relname[NAMEDATALEN];
+	uint32_t family;
+	int64_t weight;
+	int64_t bytes;
+	int worker;
+} WalWorkerTable;
+
+typedef bool (WalWorkerTableIterFun)(void *context, WalWorkerTable *table);
+
+bool catalog_write_wal_workers(DatabaseCatalog *catalog,
+							   int workers,
+							   const char *highTraffic,
+							   WalWorkerTable *tables,
+							   int count);
+bool catalog_read_wal_worker_setup(DatabaseCatalog *catalog,
+								   int *workers,
+								   char *highTraffic,
+								   size_t size,
+								   bool *found);
+bool catalog_iter_wal_worker_table(DatabaseCatalog *catalog,
+								   void *context,
+								   WalWorkerTableIterFun *callback);
+bool catalog_wal_worker_publications(DatabaseCatalog *catalog,
+									 const char *slotName,
+									 int worker,
+									 char *buf,
+									 size_t size);
+
 /*
  * Catalog sections keep track of items that have been fetched to cache
  * already, such as tables, database properties, indexes, sequences, etc etc.
