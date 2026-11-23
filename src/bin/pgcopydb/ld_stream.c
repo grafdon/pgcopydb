@@ -15,6 +15,7 @@
 #include "postgres_fe.h"
 #include "access/xlog_internal.h"
 #include "access/xlogdefs.h"
+#include "pqexpbuffer.h"
 
 #include "parson.h"
 
@@ -2330,7 +2331,95 @@ stream_setup_databases(CopyDataSpec *copySpecs, StreamSpecs *streamSpecs)
 		return false;
 	}
 
+	for (int k = 1; k < streamSpecs->walWorkers; k++)
+	{
+		char workerOrigin[NAMEDATALEN] = { 0 };
+
+		sformat(workerOrigin, sizeof(workerOrigin), "%s_w%d",
+				streamSpecs->origin, k);
+
+		if (!stream_create_origin(copySpecs, workerOrigin, slot->lsn))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+	}
+
 	return true;
+}
+
+
+typedef struct WalWorkerPublicationNames
+{
+	const char *slotName;
+	PQExpBuffer names;
+} WalWorkerPublicationNames;
+
+
+static bool
+stream_add_wal_worker_publication(void *ctx, WalWorkerTable *table)
+{
+	WalWorkerPublicationNames *context = (WalWorkerPublicationNames *) ctx;
+
+	appendPQExpBuffer(context->names, "%s%s_t%u",
+					  context->names->len == 0 ? "" : ",",
+					  context->slotName,
+					  table->oid);
+
+	return !PQExpBufferBroken(context->names);
+}
+
+
+/*
+ * stream_cleanup_wal_workers drops on the source the worker slots and the
+ * per-table publications that the catalog lists, or with workers 0 every one
+ * that matches the base slot name.
+ */
+static bool
+stream_cleanup_wal_workers(PGSQL *src, DatabaseCatalog *sourceDB,
+						   const char *slotName, int workers)
+{
+	if (workers == 0)
+	{
+		return pgsql_drop_wal_worker_slots(src, slotName) &&
+			   pgsql_drop_wal_worker_publications(src, slotName, NULL);
+	}
+
+	for (int k = 1; k < workers; k++)
+	{
+		char workerSlot[NAMEDATALEN] = { 0 };
+
+		sformat(workerSlot, sizeof(workerSlot), "%s_w%d", slotName, k);
+
+		if (!pgsql_drop_replication_slot(src, workerSlot))
+		{
+			log_error("Failed to drop replication slot \"%s\"", workerSlot);
+			return false;
+		}
+	}
+
+	WalWorkerPublicationNames context = {
+		.slotName = slotName,
+		.names = createPQExpBuffer()
+	};
+
+	if (context.names == NULL)
+	{
+		log_error(ALLOCATION_FAILED_ERROR);
+		return false;
+	}
+
+	bool success =
+		catalog_iter_wal_worker_table(sourceDB,
+									  &context,
+									  &stream_add_wal_worker_publication) &&
+		(context.names->len == 0 ||
+		 pgsql_drop_wal_worker_publications(src, slotName,
+											context.names->data));
+
+	destroyPQExpBuffer(context.names);
+
+	return success;
 }
 
 
@@ -2386,6 +2475,34 @@ stream_cleanup_databases(CopyDataSpec *copySpecs, char *slotName, char *origin)
 		}
 	}
 
+	/*
+	 * WAL worker objects go by the names the catalog lists. A catalog without
+	 * a slot row lost track of them, so they go by name pattern. A one-worker
+	 * run has none.
+	 */
+	DatabaseCatalog *sourceDB = &(copySpecs->catalogs.source);
+	char highTraffic[WAL_HIGH_TRAFFIC_TABLES_BUFSIZE] = { 0 };
+	int workers = 0;
+	bool found = false;
+
+	if (sourceDB->db != NULL &&
+		!catalog_read_wal_worker_setup(sourceDB, &workers, highTraffic,
+									   sizeof(highTraffic), &found))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	bool sweep = !found && IS_EMPTY_STRING_BUFFER(slot.slotName);
+
+	if ((found || sweep) &&
+		!stream_cleanup_wal_workers(&src, sourceDB, slotName,
+									found ? workers : 0))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
 	log_info("Removing schema pgcopydb and its objects");
 
 	if (!pgsql_execute(&src, "drop schema if exists pgcopydb cascade"))
@@ -2426,6 +2543,25 @@ stream_cleanup_databases(CopyDataSpec *copySpecs, char *slotName, char *origin)
 	if (!pgsql_replication_origin_drop(&dst, origin))
 	{
 		log_error("Failed to drop replication origin \"%s\"", origin);
+		return false;
+	}
+
+	for (int k = 1; found && k < workers; k++)
+	{
+		char workerOrigin[NAMEDATALEN] = { 0 };
+
+		sformat(workerOrigin, sizeof(workerOrigin), "%s_w%d", origin, k);
+
+		if (!pgsql_replication_origin_drop(&dst, workerOrigin))
+		{
+			log_error("Failed to drop replication origin \"%s\"", workerOrigin);
+			return false;
+		}
+	}
+
+	if (sweep && !pgsql_drop_wal_worker_origins(&dst, origin))
+	{
+		log_error("Failed to drop the replication origins of WAL workers");
 		return false;
 	}
 

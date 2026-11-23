@@ -613,13 +613,6 @@ clone_and_follow(CopyDataSpec *copySpecs)
 {
 	StreamSpecs streamSpecs = { 0 };
 
-	/* step F4 of the WAL workers plan replaces this refusal */
-	if (copySpecs->walWorkers > 1)
-	{
-		log_fatal("WAL workers are not implemented yet");
-		exit(EXIT_CODE_BAD_ARGS);
-	}
-
 	/*
 	 * Refrain from logging SQL statements in the apply module, because they
 	 * contain user data. That said, when --trace has been used, bypass that
@@ -693,6 +686,13 @@ clone_and_follow(CopyDataSpec *copySpecs)
 	{
 		/* errors have already been logged */
 		exit(EXIT_CODE_INTERNAL_ERROR);
+	}
+
+	/* step F4 of the WAL workers plan replaces this refusal */
+	if (copySpecs->walWorkers > 1)
+	{
+		log_fatal("WAL workers are not implemented yet");
+		exit(EXIT_CODE_BAD_ARGS);
 	}
 
 	/*
@@ -865,13 +865,6 @@ cli_follow(int argc, char **argv)
 {
 	CopyDataSpec copySpecs = { 0 };
 
-	/* step F4 of the WAL workers plan replaces this refusal */
-	if (copyDBoptions.walWorkers > 1)
-	{
-		log_fatal("WAL workers are not implemented yet");
-		exit(EXIT_CODE_BAD_ARGS);
-	}
-
 	(void) cli_copy_prepare_specs(&copySpecs, DATA_SECTION_ALL);
 
 	/*
@@ -930,6 +923,13 @@ cli_follow(int argc, char **argv)
 	{
 		/* errors have already been logged */
 		exit(EXIT_CODE_INTERNAL_ERROR);
+	}
+
+	/* step F4 of the WAL workers plan replaces this refusal */
+	if (copySpecs.walWorkers > 1)
+	{
+		log_fatal("WAL workers are not implemented yet");
+		exit(EXIT_CODE_BAD_ARGS);
 	}
 
 	/*

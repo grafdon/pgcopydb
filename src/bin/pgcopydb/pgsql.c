@@ -5414,20 +5414,14 @@ appendStringLiteralPub(PQExpBuffer buf, const char *str)
 }
 
 
-bool
-pgsql_create_publication(PGSQL *pgsql, const char *pubName,
-						 SourceFilters *filters)
+/*
+ * publication_append_where appends the WHERE clause that both the single
+ * publication and the per-table publications of WAL workers use.
+ */
+static void
+publication_append_where(PQExpBuffer query, SourceFilters *filters)
 {
-	PQExpBuffer query = createPQExpBuffer();
-	if (query == NULL)
-	{
-		log_error(ALLOCATION_FAILED_ERROR);
-		return false;
-	}
-
 	appendPQExpBufferStr(query,
-						 "SELECT schemaname, tablename"
-						 " FROM pg_tables"
 						 " WHERE schemaname NOT IN"
 						 " ('pg_catalog', 'information_schema', 'pgcopydb')");
 
@@ -5509,6 +5503,25 @@ pgsql_create_publication(PGSQL *pgsql, const char *pubName,
 			}
 		}
 	}
+}
+
+
+bool
+pgsql_create_publication(PGSQL *pgsql, const char *pubName,
+						 SourceFilters *filters)
+{
+	PQExpBuffer query = createPQExpBuffer();
+	if (query == NULL)
+	{
+		log_error(ALLOCATION_FAILED_ERROR);
+		return false;
+	}
+
+	appendPQExpBufferStr(query,
+						 "SELECT schemaname, tablename"
+						 " FROM pg_tables");
+
+	(void) publication_append_where(query, filters);
 
 	appendPQExpBufferStr(query, " ORDER BY schemaname, tablename");
 
@@ -5575,6 +5588,372 @@ pgsql_drop_publication(PGSQL *pgsql, const char *pubName)
 
 	log_info("Dropping publication \"%s\"", pubName);
 	return pgsql_execute(pgsql, sql);
+}
+
+
+/* <base>_w<digits> or <base>_t<digits>, without LIKE where _ is a wildcard */
+#define WAL_WORKER_NAME_MATCH(column, kind) \
+	"left(" column "::text, length($1)) = $1 " \
+				   "and substr(" column "::text, length($1) + 1) ~ '^_" kind "[0-9]+$'"
+
+
+typedef struct PublicationTablesContext
+{
+	WalWorkerTable *tables;
+	int count;
+	bool parsedOk;
+} PublicationTablesContext;
+
+
+static void
+publication_tables_parse(void *ctx, PGresult *result)
+{
+	PublicationTablesContext *context = (PublicationTablesContext *) ctx;
+	int nTuples = PQntuples(result);
+
+	/* one more slot keeps calloc away from a zero size */
+	context->tables = calloc(nTuples + 1, sizeof(WalWorkerTable));
+
+	if (context->tables == NULL)
+	{
+		log_error(ALLOCATION_FAILED_ERROR);
+		return;
+	}
+
+	for (int i = 0; i < nTuples; i++)
+	{
+		WalWorkerTable *table = &(context->tables[i]);
+		char *oid = PQgetvalue(result, i, 0);
+		char *nspname = PQgetvalue(result, i, 1);
+		char *relname = PQgetvalue(result, i, 2);
+
+		size_t nsplen = strlcpy(table->nspname, nspname, sizeof(table->nspname));
+		size_t rellen = strlcpy(table->relname, relname, sizeof(table->relname));
+
+		if (nsplen >= sizeof(table->nspname) || rellen >= sizeof(table->relname))
+		{
+			log_error("Failed to list table %s.%s for WAL workers, which "
+					  "support quoted names of at most %zu bytes",
+					  nspname, relname, sizeof(table->nspname) - 1);
+			return;
+		}
+
+		if (!stringToUInt32(oid, &(table->oid)) ||
+			!stringToUInt32(PQgetvalue(result, i, 3), &(table->family)) ||
+			!stringToInt64(PQgetvalue(result, i, 4), &(table->weight)) ||
+			!stringToInt64(PQgetvalue(result, i, 5), &(table->bytes)))
+		{
+			log_error("Failed to parse the row of table %s.%s with oid \"%s\"",
+					  nspname, relname, oid);
+			return;
+		}
+	}
+
+	context->count = nTuples;
+	context->parsedOk = true;
+}
+
+
+/*
+ * pgsql_list_publication_tables lists the tables that pgsql_create_publication
+ * publishes, with their partition family, write counters and size, for
+ * wal_workers_assign. The caller frees *tables.
+ */
+bool
+pgsql_list_publication_tables(PGSQL *pgsql, SourceFilters *filters,
+							  WalWorkerTable **tables, int *count)
+{
+	PQExpBuffer query = createPQExpBuffer();
+
+	if (query == NULL)
+	{
+		log_error(ALLOCATION_FAILED_ERROR);
+		return false;
+	}
+
+	appendPQExpBufferStr(query,
+						 "SELECT c.oid, format('%I', n.nspname),"
+						 " format('%I', c.relname),"
+						 " coalesce(pg_partition_root(c.oid)::oid, c.oid),"
+						 " coalesce((SELECT s.n_tup_ins + s.n_tup_upd + s.n_tup_del"
+						 " FROM pg_stat_user_tables s WHERE s.relid = c.oid), 0),"
+						 " pg_table_size(c.oid)"
+						 " FROM pg_tables"
+						 " JOIN pg_namespace n ON n.nspname = schemaname"
+						 " JOIN pg_class c"
+						 " ON c.relnamespace = n.oid AND c.relname = tablename");
+
+	(void) publication_append_where(query, filters);
+
+	appendPQExpBufferStr(query, " ORDER BY schemaname, tablename");
+
+	PublicationTablesContext context = { 0 };
+
+	bool success =
+		pgsql_execute_with_params(pgsql, query->data, 0, NULL, NULL,
+								  &context, &publication_tables_parse);
+
+	destroyPQExpBuffer(query);
+
+	if (!success || !context.parsedOk)
+	{
+		log_error("Failed to list the tables to publish for WAL workers");
+		free(context.tables);
+		return false;
+	}
+
+	*tables = context.tables;
+	*count = context.count;
+
+	return true;
+}
+
+
+/*
+ * pgsql_create_table_publications creates one publication per table in one
+ * transaction. ONLY keeps an inheritance child out of its parent's
+ * publication; a partitioned table publishes its partitions regardless.
+ */
+bool
+pgsql_create_table_publications(PGSQL *pgsql, const char *slotName,
+								WalWorkerTable *tables, int count)
+{
+	log_info("Creating %d publications \"%s_t<oid>\", one per table",
+			 count, slotName);
+
+	if (!pgsql_begin(pgsql))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	for (int i = 0; i < count; i++)
+	{
+		WalWorkerTable *table = &(tables[i]);
+		char sql[BUFSIZE] = { 0 };
+
+		sformat(sql, sizeof(sql),
+				"CREATE PUBLICATION \"%s_t%u\" FOR TABLE ONLY %s.%s",
+				slotName, table->oid, table->nspname, table->relname);
+
+		log_debug("%s", sql);
+
+		if (!pgsql_execute(pgsql, sql))
+		{
+			log_error("Failed to create publication \"%s_t%u\" for table %s.%s",
+					  slotName, table->oid, table->nspname, table->relname);
+			(void) pgsql_finish(pgsql);
+			return false;
+		}
+	}
+
+	return pgsql_commit(pgsql);
+}
+
+
+/*
+ * pgsql_copy_logical_replication_slot copies a slot with its restart_lsn,
+ * confirmed flush LSN and catalog_xmin, and returns the copy's confirmed flush.
+ */
+bool
+pgsql_copy_logical_replication_slot(PGSQL *pgsql, const char *srcName,
+									const char *dstName, uint64_t *lsn)
+{
+	SingleValueResultContext context = { { 0 }, PGSQL_RESULT_STRING, false };
+
+	char *sql = "select lsn from pg_copy_logical_replication_slot($1, $2)";
+	Oid paramTypes[2] = { NAMEOID, NAMEOID };
+	const char *paramValues[2] = { srcName, dstName };
+
+	log_info("Copying replication slot \"%s\" to \"%s\"", srcName, dstName);
+
+	if (!pgsql_execute_with_params(pgsql, sql, 2, paramTypes, paramValues,
+								   &context, &parseSingleValueResult))
+	{
+		log_error("Failed to copy replication slot \"%s\" to \"%s\"",
+				  srcName, dstName);
+		return false;
+	}
+
+	if (!context.parsedOk || context.isNull || !parseLSN(context.strVal, lsn))
+	{
+		log_error("Failed to parse LSN \"%s\" of replication slot \"%s\"",
+				  context.strVal == NULL ? "" : context.strVal,
+				  dstName);
+		return false;
+	}
+
+	return true;
+}
+
+
+/*
+ * pgsql_check_wal_worker_slot fails unless the slot exists, uses pgoutput, is
+ * not invalidated, and has its confirmed flush LSN at or above lsn.
+ */
+bool
+pgsql_check_wal_worker_slot(PGSQL *pgsql, const char *slotName, uint64_t lsn)
+{
+	SingleValueResultContext context = { { 0 }, PGSQL_RESULT_STRING, false };
+	char sql[BUFSIZE] = { 0 };
+	char lsnString[PG_LSN_MAXLENGTH] = { 0 };
+
+	if (!pgsql_server_version(pgsql))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	/* every invalidation shows as wal_status lost, Postgres 12 has none */
+	sformat(sql, sizeof(sql),
+			"select case"
+			" when plugin is distinct from 'pgoutput'"
+			" then 'uses plugin ' || coalesce(plugin::text, 'none')"
+			" when %s then 'is invalidated'"
+			" when confirmed_flush_lsn is null or confirmed_flush_lsn < $2"
+			" then 'is at ' || coalesce(confirmed_flush_lsn::text, 'no LSN')"
+			" || ', below ' || $2::text"
+			" else '' end"
+			" from pg_replication_slots where slot_name = $1",
+			pgsql->pgversion_num >= 130000 ? "wal_status = 'lost'" : "false");
+
+	sformat(lsnString, sizeof(lsnString), "%X/%X", LSN_FORMAT_ARGS(lsn));
+
+	Oid paramTypes[2] = { NAMEOID, LSNOID };
+	const char *paramValues[2] = { slotName, lsnString };
+
+	if (!pgsql_execute_with_params(pgsql, sql, 2, paramTypes, paramValues,
+								   &context, &parseSingleValueResult))
+	{
+		log_error("Failed to check replication slot \"%s\"", slotName);
+		return false;
+	}
+
+	if (context.ntuples == 0)
+	{
+		log_error("Replication slot \"%s\" does not exist", slotName);
+		return false;
+	}
+
+	if (!context.parsedOk || context.isNull)
+	{
+		log_error("Failed to check replication slot \"%s\"", slotName);
+		return false;
+	}
+
+	if (*context.strVal != '\0')
+	{
+		log_error("Replication slot \"%s\" %s", slotName, context.strVal);
+		return false;
+	}
+
+	return true;
+}
+
+
+/*
+ * pgsql_drop_wal_worker_slots drops the slots named <slotName>_w<digits>.
+ * pg_drop_replication_slot fails on a slot in use instead of waiting.
+ */
+bool
+pgsql_drop_wal_worker_slots(PGSQL *pgsql, const char *slotName)
+{
+	char *sql =
+		"select pg_drop_replication_slot(slot_name) "
+		"  from pg_replication_slots "
+		" where " WAL_WORKER_NAME_MATCH("slot_name", "w");
+	Oid paramTypes[1] = { TEXTOID };
+	const char *paramValues[1] = { slotName };
+
+	log_info("Dropping replication slots matching \"%s_w<digits>\"", slotName);
+
+	return pgsql_execute_with_params(pgsql, sql, 1, paramTypes, paramValues,
+									 NULL, NULL);
+}
+
+
+/*
+ * pgsql_drop_wal_worker_origins drops the replication origins named
+ * <origin>_w<digits>. pg_replication_origin_drop fails on an origin in use.
+ */
+bool
+pgsql_drop_wal_worker_origins(PGSQL *pgsql, const char *origin)
+{
+	char *sql =
+		"select pg_replication_origin_drop(roname) "
+		"  from pg_replication_origin "
+		" where " WAL_WORKER_NAME_MATCH("roname", "w");
+	Oid paramTypes[1] = { TEXTOID };
+	const char *paramValues[1] = { origin };
+
+	log_info("Dropping replication origins matching \"%s_w<digits>\"", origin);
+
+	return pgsql_execute_with_params(pgsql, sql, 1, paramTypes, paramValues,
+									 NULL, NULL);
+}
+
+
+/*
+ * pgsql_drop_wal_worker_publications drops in one statement the publications
+ * in the comma-separated names, or with names NULL the publications named
+ * <slotName>_t<digits>.
+ */
+bool
+pgsql_drop_wal_worker_publications(PGSQL *pgsql, const char *slotName,
+								   const char *names)
+{
+	SingleValueResultContext context = { { 0 }, PGSQL_RESULT_STRING, false };
+
+	char *sql =
+		names == NULL
+		? "select string_agg(quote_ident(pubname), ', ' order by pubname) "
+		  "  from pg_publication "
+		  " where " WAL_WORKER_NAME_MATCH("pubname", "t")
+		: "select string_agg(quote_ident(pubname), ', ' order by pubname) "
+		  "  from pg_publication "
+		  " where pubname::text = any(string_to_array($1, ','))";
+	Oid paramTypes[1] = { TEXTOID };
+	const char *paramValues[1] = { names == NULL ? slotName : names };
+
+	if (names == NULL)
+	{
+		log_info("Dropping publications matching \"%s_t<digits>\"", slotName);
+	}
+	else
+	{
+		log_info("Dropping the publications \"%s_t<oid>\" of the WAL worker "
+				 "tables",
+				 slotName);
+	}
+
+	if (!pgsql_execute_with_params(pgsql, sql, 1, paramTypes, paramValues,
+								   &context, &parseSingleValueResult) ||
+		!context.parsedOk)
+	{
+		log_error("Failed to list the publications to drop");
+		return false;
+	}
+
+	if (context.isNull)
+	{
+		return true;
+	}
+
+	PQExpBuffer drop = createPQExpBuffer();
+
+	if (drop == NULL)
+	{
+		log_error(ALLOCATION_FAILED_ERROR);
+		return false;
+	}
+
+	appendPQExpBuffer(drop, "DROP PUBLICATION IF EXISTS %s", context.strVal);
+
+	bool success = pgsql_execute(pgsql, drop->data);
+
+	destroyPQExpBuffer(drop);
+
+	return success;
 }
 
 

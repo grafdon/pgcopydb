@@ -522,7 +522,9 @@ The following options are available to ``pgcopydb follow``:
 
   Number of processes that receive and apply changes, from 1 to 16.
   The default is 1, which keeps the replication slot, origin and publication names of a single process.
-  Running more than one WAL worker is not implemented yet: a value above 1 passes the checks below and then stops with an error.
+  Running more than one WAL worker is not implemented yet: a value above 1 passes the checks below, creates the replication slots, publications and origins of every worker, and then stops with an error.
+  Drop those with ``pgcopydb stream cleanup``.
+  Worker k, from 1 to N-1, uses the slot ``<slot>_w<k>`` and the origin ``<origin>_w<k>`` while worker 0 keeps the given names, and each published table gets its own publication ``<slot>_t<oid>`` instead of one publication for all tables.
 
   A value above 1 requires the pgoutput plugin, a publication that pgcopydb manages (no ``--publication``), no ``--all-databases``, a slot name of at most 51 bytes and an origin of at most 59 bytes.
   The slot name and the origin must not end in ``_w<digits>`` or ``_t<digits>``, because WAL workers name their own slots, origins and publications that way.

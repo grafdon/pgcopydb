@@ -89,6 +89,10 @@ The command ``pgcopydb stream cleanup`` connects to the source and target
 databases to delete the objects created in the ``pgcopydb stream setup``
 step.
 
+When the catalog in the work directory records WAL workers, the command also drops the worker slots ``<slot>_w<k>``, the publications ``<slot>_t<oid>`` and the worker origins ``<origin>_w<k>`` that it lists.
+When the work directory has no catalog that records a replication slot, for instance an empty directory created after the original one was lost, it drops every slot named ``<slot>_w<digits>``, every publication named ``<slot>_t<digits>`` and every origin named ``<origin>_w<digits>``.
+A slot or an origin that is in use makes the command fail.
+
 .. include:: ../include/stream-cleanup.rst
 
 .. _pgcopydb_stream_prune:
