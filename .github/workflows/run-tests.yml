@@ -162,6 +162,7 @@ jobs:
           - cdc-receive-group-commit
           - cdc-endpos-before-txn
           - cdc-file-rotation-live
+          - cdc-wal-workers
         exclude:
           # timescaledb uses timescale/timescaledb:latest-pg13 for both source
           # and target. pg_restore from PG17+ emits "SET transaction_timeout = 0"
@@ -237,6 +238,8 @@ jobs:
           - TEST: cdc-endpos-before-txn
             PGVERSION: 16
           - TEST: cdc-file-rotation-live
+            PGVERSION: 16
+          - TEST: cdc-wal-workers
             PGVERSION: 16
     steps:
       - name: Checkout repository

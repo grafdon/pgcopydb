@@ -16,7 +16,7 @@ all: pagila pagila-multi-steps blobs unit filtering extensions \
 	 cdc-truncate-multi cdc-copy-multi-insert cdc-origin-abort \
 	 cdc-receive-drain-error cdc-receive-reconnect-dying-source \
 	 cdc-receive-status-interval cdc-apply-wakeup catalog-stmt-cache \
-	 cdc-receive-group-commit cdc-endpos-before-txn \
+	 cdc-receive-group-commit cdc-endpos-before-txn cdc-wal-workers \
 	 follow-wal2json follow-9.6 follow-data-only \
 	 follow-pgoutput follow-filtering follow-resume-snapshot \
 	 orphaned-target-backend split-table-resume \
@@ -96,6 +96,9 @@ cdc-pgoutput-resume: build
 	$(MAKE) -C $@
 
 cdc-keepalive: build
+	$(MAKE) -C $@
+
+cdc-wal-workers: build
 	$(MAKE) -C $@
 
 cdc-filtering-pgoutput: build
@@ -216,7 +219,7 @@ clean-images:
 .PHONY: cdc-interleaved-commits cdc-resend-after-reconnect cdc-commit-order-resume
 .PHONY: cdc-truncate-multi cdc-copy-multi-insert cdc-origin-abort cdc-receive-drain-error
 .PHONY: cdc-receive-reconnect-dying-source cdc-receive-status-interval cdc-apply-wakeup
-.PHONY: catalog-stmt-cache cdc-receive-group-commit cdc-endpos-before-txn
+.PHONY: catalog-stmt-cache cdc-receive-group-commit cdc-endpos-before-txn cdc-wal-workers
 .PHONY: follow-wal2json follow-9.6 follow-resume-snapshot orphaned-target-backend split-table-resume
 .PHONY: all-databases-resume large-objects-resume json-logs
 .PHONY: defer-indexes defer-indexes-queue defer-indexes-all-databases

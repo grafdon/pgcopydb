@@ -522,6 +522,7 @@ copydb_init_specs(CopyDataSpec *specs,
 		.failFast = options->failFast,
 		.deferIndexes = options->deferIndexes,
 		.useCopyBinary = options->useCopyBinary,
+		.walWorkers = options->walWorkers,
 
 		.restart = options->restart,
 		.resume = options->resume,
@@ -549,6 +550,10 @@ copydb_init_specs(CopyDataSpec *specs,
 
 		.catalogs = { 0 }
 	};
+
+	strlcpy(tmpCopySpecs.walHighTrafficTables,
+			options->walHighTrafficTables,
+			sizeof(tmpCopySpecs.walHighTrafficTables));
 
 	if (!IS_EMPTY_STRING_BUFFER(options->snapshot))
 	{

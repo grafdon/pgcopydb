@@ -847,6 +847,20 @@ The following options are available to ``pgcopydb clone``:
 
   __ https://www.postgresql.org/docs/current/replication-origins.html
 
+--wal-workers
+
+  Number of processes that receive and apply changes, from 1 to 16.
+  The default is 1, which keeps the replication slot, origin and publication names of a single process.
+  Running more than one WAL worker is not implemented yet: a value above 1 passes the checks below and then stops with an error.
+
+  A value above 1 requires the pgoutput plugin, a publication that pgcopydb manages (no ``--publication``), no ``--all-databases``, ``--follow``, a slot name of at most 51 bytes and an origin of at most 59 bytes.
+  The slot name and the origin must not end in ``_w<digits>`` or ``_t<digits>``, because WAL workers name their own slots, origins and publications that way.
+
+--wal-high-traffic-tables
+
+  Comma-separated list of ``schema.table`` entries, without spaces, that each get a WAL worker of their own.
+  The list requires ``--wal-workers`` above 1, holds at most as many entries as WAL workers, and names each table once.
+
 --verbose, --notice
 
   Increase current verbosity. The default level of verbosity is INFO. In
@@ -949,6 +963,16 @@ PGCOPYDB_WAL2JSON_NUMERIC_AS_STRING
 
    When ``--wal2json-numeric-as-string`` is ommitted from the command line
    then this environment variable is used.
+
+PGCOPYDB_WAL_WORKERS
+
+   Number of WAL workers, from 1 to 16.
+   When ``--wal-workers`` is omitted from the command line, then this environment variable is used.
+
+PGCOPYDB_WAL_HIGH_TRAFFIC_TABLES
+
+   Tables that each get a WAL worker of their own.
+   When ``--wal-high-traffic-tables`` is omitted from the command line, then this environment variable is used.
 
 PGCOPYDB_DROP_IF_EXISTS
 

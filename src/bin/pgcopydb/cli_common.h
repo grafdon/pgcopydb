@@ -89,6 +89,9 @@ typedef struct CopyDBOptions
 	bool follow;
 	bool createSlot;
 
+	int walWorkers;
+	char walHighTrafficTables[WAL_HIGH_TRAFFIC_TABLES_BUFSIZE];
+
 	/* pgcopydb stream sentinel get --flush-lsn and friends */
 	SentinelOptions sentinelOptions;
 

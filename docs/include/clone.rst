@@ -45,4 +45,6 @@
      --endpos                      Stop replaying changes when reaching this LSN
      --use-copy-binary             Use the COPY BINARY format for COPY operations
      --all-databases               Clone all databases found on the source instance
+     --wal-workers                 Number of processes replaying changes, 1 to 16
+     --wal-high-traffic-tables     Tables that get a WAL worker of their own
    

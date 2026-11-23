@@ -732,6 +732,9 @@ struct StreamSpecs
 	char coordHost[256];
 	int coordPort;
 
+	int walWorkers;
+	bool walWorker;             /* this process is one of walWorkers */
+
 	/*
 	 * User-specified source filters.  For pgoutput the publication is created
 	 * with a filter-aware FOR TABLE list; for wal2json the filter-tables (and

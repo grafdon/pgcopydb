@@ -340,6 +340,9 @@ typedef struct CopyDataSpec
 	bool follow;                /* pgcopydb fork --follow */
 	bool allDatabases;          /* pgcopydb clone --all-databases */
 
+	int walWorkers;
+	char walHighTrafficTables[WAL_HIGH_TRAFFIC_TABLES_BUFSIZE];
+
 	/*
 	 * Database name for log messages in per-database workers.  Empty string
 	 * in the single-database code path; set to the database name in

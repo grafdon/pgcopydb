@@ -158,6 +158,7 @@ jobs:
           - cdc-copy-multi-insert
           - cdc-receive-group-commit
           - cdc-endpos-before-txn
+          - cdc-wal-workers
         exclude:
           # timescaledb uses timescale/timescaledb:latest-pg13 for both source
           # and target. pg_restore from PG17+ emits "SET transaction_timeout = 0"

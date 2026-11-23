@@ -7,6 +7,7 @@
  * Licensed under the PostgreSQL License.
  *
  */
+#include <ctype.h>
 #include <errno.h>
 #include <inttypes.h>
 #include <getopt.h>
@@ -219,6 +220,7 @@ cli_copydb_getenv(CopyDBOptions *options)
 	options->restoreOptions.jobs = DEFAULT_RESTORE_JOBS;
 	options->lObjectJobs = DEFAULT_LARGE_OBJECTS_JOBS;
 	options->splitTablesLargerThan.bytes = DEFAULT_SPLIT_TABLES_LARGER_THAN;
+	options->walWorkers = DEFAULT_WAL_WORKERS;
 
 	EnvParser parsers[] = {
 		{
@@ -288,6 +290,15 @@ cli_copydb_getenv(CopyDBOptions *options)
 		{
 			PGCOPYDB_REPLAY_NO_OP_UPDATES, ENV_TYPE_BOOL,
 			&(options->replayNoOpUpdates)
+		},
+		{
+			PGCOPYDB_WAL_WORKERS, ENV_TYPE_INT,
+			&(options->walWorkers), 0, true, 1, true, MAX_WAL_WORKERS
+		},
+		{
+			PGCOPYDB_WAL_HIGH_TRAFFIC_TABLES, ENV_TYPE_STRING,
+			&(options->walHighTrafficTables),
+			sizeof(options->walHighTrafficTables)
 		}
 	};
 
@@ -399,6 +410,186 @@ cli_copydb_is_consistent(CopyDBOptions *options)
 	}
 
 	return true;
+}
+
+
+/*
+ * cli_name_has_wal_worker_suffix returns true for a name ending in _w<digits>
+ * or _t<digits>, which WAL worker slots, origins and publications use.
+ */
+static bool
+cli_name_has_wal_worker_suffix(const char *name)
+{
+	const char *sep = strrchr(name, '_');
+
+	if (sep == NULL || (sep[1] != 'w' && sep[1] != 't') || sep[2] == '\0')
+	{
+		return false;
+	}
+
+	for (const char *ptr = sep + 2; *ptr != '\0'; ptr++)
+	{
+		if (!isdigit((unsigned char) *ptr))
+		{
+			return false;
+		}
+	}
+
+	return true;
+}
+
+
+/*
+ * cli_validate_wal_high_traffic_tables checks the syntax of the list only,
+ * matching entries against the source tables needs the catalog.
+ */
+static bool
+cli_validate_wal_high_traffic_tables(CopyDBOptions *options)
+{
+	const char *list = options->walHighTrafficTables;
+
+	if (IS_EMPTY_STRING_BUFFER(options->walHighTrafficTables))
+	{
+		return true;
+	}
+
+	if (options->walWorkers <= 1)
+	{
+		log_fatal("Option --wal-high-traffic-tables requires --wal-workers "
+				  "above 1, found --wal-workers %d",
+				  options->walWorkers);
+		return false;
+	}
+
+	const char *entries[MAX_WAL_WORKERS] = { 0 };
+	int lengths[MAX_WAL_WORKERS] = { 0 };
+	int count = 0;
+
+	for (const char *entry = list; entry != NULL;)
+	{
+		const char *comma = strchr(entry, ',');
+		int len = comma == NULL ? (int) strlen(entry) : (int) (comma - entry);
+		const char *dot = memchr(entry, '.', len);
+		bool valid = dot != NULL && dot > entry && dot < entry + len - 1 &&
+					 memchr(dot + 1, '.', entry + len - dot - 1) == NULL;
+
+		for (int i = 0; valid && i < len; i++)
+		{
+			valid = !isspace((unsigned char) entry[i]);
+		}
+
+		if (!valid)
+		{
+			log_fatal("Failed to parse --wal-high-traffic-tables entry \"%.*s\", "
+					  "expected schema.table",
+					  len, entry);
+			return false;
+		}
+
+		for (int i = 0; i < count; i++)
+		{
+			if (lengths[i] == len && strncmp(entries[i], entry, len) == 0)
+			{
+				log_fatal("Option --wal-high-traffic-tables lists \"%.*s\" "
+						  "more than once",
+						  len, entry);
+				return false;
+			}
+		}
+
+		if (count == options->walWorkers)
+		{
+			log_fatal("Option --wal-high-traffic-tables lists more tables "
+					  "than --wal-workers %d",
+					  options->walWorkers);
+			return false;
+		}
+
+		entries[count] = entry;
+		lengths[count] = len;
+		++count;
+
+		entry = comma == NULL ? NULL : comma + 1;
+	}
+
+	return true;
+}
+
+
+/*
+ * cli_validate_wal_workers refuses option combinations that WAL workers do not
+ * support, once options, environment and the previous run are merged.
+ */
+static bool
+cli_validate_wal_workers(CopyDBOptions *options)
+{
+	int n = options->walWorkers;
+	ReplicationSlot *slot = &(options->slot);
+
+	if (n > 1)
+	{
+		if (slot->plugin != STREAM_PLUGIN_PGOUTPUT)
+		{
+			log_fatal("Option --wal-workers %d requires --plugin pgoutput, "
+					  "found --plugin %s",
+					  n, OutputPluginToString(slot->plugin));
+			return false;
+		}
+
+		if (!slot->publicationAutoManaged)
+		{
+			log_fatal("Option --wal-workers %d is not compatible with "
+					  "--publication \"%s\"",
+					  n, slot->publicationName);
+			return false;
+		}
+
+		if (options->allDatabases)
+		{
+			log_fatal("Option --wal-workers %d is not compatible with "
+					  "--all-databases",
+					  n);
+			return false;
+		}
+
+		if (strlen(slot->slotName) > MAX_WAL_WORKERS_SLOT_NAME_LEN)
+		{
+			log_fatal("Option --wal-workers %d requires a slot name of at most "
+					  "%d bytes, found --slot-name \"%s\" (%zu bytes)",
+					  n, MAX_WAL_WORKERS_SLOT_NAME_LEN,
+					  slot->slotName, strlen(slot->slotName));
+			return false;
+		}
+
+		if (strlen(options->origin) > MAX_WAL_WORKERS_ORIGIN_LEN)
+		{
+			log_fatal("Option --wal-workers %d requires an origin of at most "
+					  "%d bytes, found --origin \"%s\" (%zu bytes)",
+					  n, MAX_WAL_WORKERS_ORIGIN_LEN,
+					  options->origin, strlen(options->origin));
+			return false;
+		}
+
+		if (cli_name_has_wal_worker_suffix(slot->slotName))
+		{
+			log_fatal("Option --wal-workers %d is not compatible with "
+					  "--slot-name \"%s\": names ending in _w<digits> or "
+					  "_t<digits> are reserved for WAL workers",
+					  n, slot->slotName);
+			return false;
+		}
+
+		if (cli_name_has_wal_worker_suffix(options->origin))
+		{
+			log_fatal("Option --wal-workers %d is not compatible with "
+					  "--origin \"%s\": names ending in _w<digits> or "
+					  "_t<digits> are reserved for WAL workers",
+					  n, options->origin);
+			return false;
+		}
+	}
+
+	return cli_validate_wal_high_traffic_tables(options);
 }
 
 
@@ -592,6 +783,12 @@ cli_read_previous_options(CopyDBOptions *options, CopyFilePaths *cfPaths)
 		options->slot.publicationAutoManaged = true;
 	}
 
+	if (!cli_validate_wal_workers(options))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
 	return true;
 }
 
@@ -755,6 +952,8 @@ cli_copy_db_getopts(int argc, char **argv)
 		{ "all-databases", no_argument, NULL, 1004 },
 		{ "replay-no-op-updates", no_argument, NULL, 1005 },
 		{ "defer-indexes", no_argument, NULL, 1006 },
+		{ "wal-workers", required_argument, NULL, 1007 },
+		{ "wal-high-traffic-tables", required_argument, NULL, 1008 },
 		{ "host", required_argument, NULL, 1001 },
 		{ "port", required_argument, NULL, 1002 },
 		{ "version", no_argument, NULL, 'V' },
@@ -1153,6 +1352,38 @@ cli_copy_db_getopts(int argc, char **argv)
 			{
 				options.deferIndexes = true;
 				log_trace("--defer-indexes");
+				break;
+			}
+
+			case 1007:      /* --wal-workers */
+			{
+				if (!stringToInt(optarg, &(options.walWorkers)) ||
+					options.walWorkers < 1 ||
+					options.walWorkers > MAX_WAL_WORKERS)
+				{
+					log_fatal("Failed to parse --wal-workers \"%s\", "
+							  "expected an integer from 1 to %d",
+							  optarg, MAX_WAL_WORKERS);
+					exit(EXIT_CODE_BAD_ARGS);
+				}
+				log_trace("--wal-workers %d", options.walWorkers);
+				break;
+			}
+
+			case 1008:      /* --wal-high-traffic-tables */
+			{
+				size_t len = strlcpy(options.walHighTrafficTables, optarg,
+									 sizeof(options.walHighTrafficTables));
+
+				if (len >= sizeof(options.walHighTrafficTables))
+				{
+					log_fatal("Failed to parse --wal-high-traffic-tables: "
+							  "%zu bytes given, pgcopydb supports up to %zu bytes",
+							  len, sizeof(options.walHighTrafficTables) - 1);
+					exit(EXIT_CODE_BAD_ARGS);
+				}
+				log_trace("--wal-high-traffic-tables %s",
+						  options.walHighTrafficTables);
 				break;
 			}
 

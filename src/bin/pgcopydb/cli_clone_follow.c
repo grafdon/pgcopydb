@@ -70,6 +70,8 @@
 	"  --endpos                      Stop replaying changes when reaching this LSN\n" \
 	"  --use-copy-binary             Use the COPY BINARY format for COPY operations\n" \
 	"  --all-databases               Clone all databases found on the source instance\n" \
+	"  --wal-workers                 Number of processes replaying changes, 1 to 16\n" \
+	"  --wal-high-traffic-tables     Tables that get a WAL worker of their own\n" \
 
 CommandLine clone_command =
 	make_command(
@@ -108,7 +110,9 @@ CommandLine follow_command =
 		"  --slot-name                   Use this Postgres replication slot name\n"
 		"  --create-slot                 Create the replication slot\n"
 		"  --origin                      Use this Postgres replication origin node name\n"
-		"  --endpos                      Stop replaying changes when reaching this LSN\n",
+		"  --endpos                      Stop replaying changes when reaching this LSN\n"
+		"  --wal-workers                 Number of processes replaying changes, 1 to 16\n"
+		"  --wal-high-traffic-tables     Tables that get a WAL worker of their own\n",
 		cli_copy_db_getopts,
 		cli_follow);
 
@@ -493,6 +497,13 @@ cli_clone(int argc, char **argv)
 {
 	CopyDataSpec copySpecs = { 0 };
 
+	if (copyDBoptions.walWorkers > 1 && !copyDBoptions.follow)
+	{
+		log_fatal("Option --wal-workers %d requires --follow",
+				  copyDBoptions.walWorkers);
+		exit(EXIT_CODE_BAD_ARGS);
+	}
+
 	(void) cli_copy_prepare_specs(&copySpecs, DATA_SECTION_ALL);
 
 	/* at the moment these are not covered by cli_copy_prepare_specs() */
@@ -602,6 +613,13 @@ clone_and_follow(CopyDataSpec *copySpecs)
 {
 	StreamSpecs streamSpecs = { 0 };
 
+	/* step F4 of the WAL workers plan replaces this refusal */
+	if (copySpecs->walWorkers > 1)
+	{
+		log_fatal("WAL workers are not implemented yet");
+		exit(EXIT_CODE_BAD_ARGS);
+	}
+
 	/*
 	 * Refrain from logging SQL statements in the apply module, because they
 	 * contain user data. That said, when --trace has been used, bypass that
@@ -638,6 +656,7 @@ clone_and_follow(CopyDataSpec *copySpecs)
 	strlcpy(streamSpecs.coordHost, copyDBoptions.host,
 			sizeof(streamSpecs.coordHost));
 	streamSpecs.coordPort = copyDBoptions.port;
+	streamSpecs.walWorkers = copySpecs->walWorkers;
 
 	/*
 	 * When using pgcopydb clone --follow --restart we first cleanup the
@@ -846,6 +865,13 @@ cli_follow(int argc, char **argv)
 {
 	CopyDataSpec copySpecs = { 0 };
 
+	/* step F4 of the WAL workers plan replaces this refusal */
+	if (copyDBoptions.walWorkers > 1)
+	{
+		log_fatal("WAL workers are not implemented yet");
+		exit(EXIT_CODE_BAD_ARGS);
+	}
+
 	(void) cli_copy_prepare_specs(&copySpecs, DATA_SECTION_ALL);
 
 	/*
@@ -885,6 +911,7 @@ cli_follow(int argc, char **argv)
 	/* optional follow coordinator TCP endpoint (--host/--port or env) */
 	strlcpy(specs.coordHost, copyDBoptions.host, sizeof(specs.coordHost));
 	specs.coordPort = copyDBoptions.port;
+	specs.walWorkers = copySpecs.walWorkers;
 
 	/*
 	 * First create/export a snapshot for the whole clone --follow operations.
