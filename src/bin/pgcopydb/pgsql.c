@@ -5765,8 +5765,6 @@ pgsql_copy_logical_replication_slot(PGSQL *pgsql, const char *srcName,
 	Oid paramTypes[2] = { NAMEOID, NAMEOID };
 	const char *paramValues[2] = { srcName, dstName };
 
-	log_info("Copying replication slot \"%s\" to \"%s\"", srcName, dstName);
-
 	if (!pgsql_execute_with_params(pgsql, sql, 2, paramTypes, paramValues,
 								   &context, &parseSingleValueResult))
 	{
@@ -5782,6 +5780,9 @@ pgsql_copy_logical_replication_slot(PGSQL *pgsql, const char *srcName,
 				  dstName);
 		return false;
 	}
+
+	log_info("Copied replication slot \"%s\" to \"%s\" at %X/%X",
+			 srcName, dstName, LSN_FORMAT_ARGS(*lsn));
 
 	return true;
 }

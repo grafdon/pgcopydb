@@ -115,6 +115,11 @@ bool catalog_wal_worker_publications(DatabaseCatalog *catalog,
 									 int worker,
 									 char *buf,
 									 size_t size);
+bool catalog_copy_wal_worker_catalog(DatabaseCatalog *worker,
+									 DatabaseCatalog *source,
+									 const char *cdcDir,
+									 const char *workerDir,
+									 const ReplicationSlot *slot);
 
 /*
  * Catalog sections keep track of items that have been fetched to cache

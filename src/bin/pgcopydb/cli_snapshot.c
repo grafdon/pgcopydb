@@ -73,6 +73,10 @@ cli_create_snapshot_getopts(int argc, char **argv)
 		exit(EXIT_CODE_BAD_ARGS);
 	}
 
+	/* only clone and follow validate and set up WAL workers */
+	options.walWorkers = DEFAULT_WAL_WORKERS;
+	options.walHighTrafficTables[0] = '\0';
+
 	while ((c = getopt_long(argc, argv, "S:D:fp:ws:Vvdzqh",
 							long_options, &option_index)) != -1)
 	{

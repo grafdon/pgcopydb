@@ -379,8 +379,8 @@ copydb_should_export_snapshot(CopyDataSpec *copySpecs)
 
 
 /*
- * copydb_wal_workers_source connects to the source, which needs Postgres 12
- * for pg_partition_root and pg_copy_logical_replication_slot.
+ * copydb_wal_workers_source connects to the source, which needs Postgres 13:
+ * Postgres 12 cannot add a partitioned table to a publication.
  */
 static bool
 copydb_wal_workers_source(CopyDataSpec *copySpecs, PGSQL *src)
@@ -392,9 +392,9 @@ copydb_wal_workers_source(CopyDataSpec *copySpecs, PGSQL *src)
 		return false;
 	}
 
-	if (src->pgversion_num < 120000)
+	if (src->pgversion_num < 130000)
 	{
-		log_fatal("Option --wal-workers %d requires Postgres 12 or later "
+		log_fatal("Option --wal-workers %d requires Postgres 13 or later "
 				  "on the source, found Postgres %s",
 				  copySpecs->walWorkers, src->pgversion);
 		return false;

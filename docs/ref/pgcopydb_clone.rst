@@ -851,11 +851,18 @@ The following options are available to ``pgcopydb clone``:
 
   Number of processes that receive and apply changes, from 1 to 16.
   The default is 1, which keeps the replication slot, origin and publication names of a single process.
-  Running more than one WAL worker is not implemented yet: a value above 1 passes the checks below, creates the replication slots, publications and origins of every worker, and then stops with an error.
-  Drop those with ``pgcopydb stream cleanup``.
+  With a value above 1, the follow process supervises N WAL workers, and each of them runs its own receive and apply processes for the tables assigned to it.
   Worker k, from 1 to N-1, uses the slot ``<slot>_w<k>`` and the origin ``<origin>_w<k>`` while worker 0 keeps the given names, and each published table gets its own publication ``<slot>_t<oid>`` instead of one publication for all tables.
+  Each worker keeps its catalog and its CDC files in the ``w<k>`` sub-directory of the CDC directory.
 
-  A value above 1 requires the pgoutput plugin, a publication that pgcopydb manages (no ``--publication``), no ``--all-databases``, ``--follow``, a slot name of at most 51 bytes and an origin of at most 59 bytes.
+  The sentinel of the work directory stays the place to control and watch the run.
+  The supervisor copies its endpos and apply settings to every worker, and ``pgcopydb stream sentinel get`` reports the lowest write, flush and replay LSN of all workers.
+  The command finishes when every worker has reached endpos.
+  When a worker fails, or a signal asks the supervisor to stop, the supervisor stops the other workers and the command exits with an error.
+  A worker also stops when its supervisor exits, and on Linux its receive and apply processes stop when it exits.
+  ``pgcopydb stream cleanup`` drops the slots, publications and origins of every worker.
+
+  A value above 1 requires a source running Postgres 13 or later, the pgoutput plugin, a publication that pgcopydb manages (no ``--publication``), no ``--all-databases``, ``--follow``, a slot name of at most 51 bytes and an origin of at most 59 bytes.
   The slot name and the origin must not end in ``_w<digits>`` or ``_t<digits>``, because WAL workers name their own slots, origins and publications that way.
 
 --wal-high-traffic-tables
@@ -970,6 +977,7 @@ PGCOPYDB_WAL_WORKERS
 
    Number of WAL workers, from 1 to 16.
    When ``--wal-workers`` is omitted from the command line, then this environment variable is used.
+   Only ``pgcopydb clone`` and ``pgcopydb follow`` use it: ``pgcopydb snapshot --follow`` always sets up a single WAL worker.
 
 PGCOPYDB_WAL_HIGH_TRAFFIC_TABLES
 

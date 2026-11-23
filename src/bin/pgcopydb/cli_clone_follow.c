@@ -504,6 +504,12 @@ cli_clone(int argc, char **argv)
 		exit(EXIT_CODE_BAD_ARGS);
 	}
 
+	if (!cli_validate_wal_workers(&copyDBoptions))
+	{
+		/* errors have already been logged */
+		exit(EXIT_CODE_BAD_ARGS);
+	}
+
 	(void) cli_copy_prepare_specs(&copySpecs, DATA_SECTION_ALL);
 
 	/* at the moment these are not covered by cli_copy_prepare_specs() */
@@ -688,13 +694,6 @@ clone_and_follow(CopyDataSpec *copySpecs)
 		exit(EXIT_CODE_INTERNAL_ERROR);
 	}
 
-	/* step F4 of the WAL workers plan replaces this refusal */
-	if (copySpecs->walWorkers > 1)
-	{
-		log_fatal("WAL workers are not implemented yet");
-		exit(EXIT_CODE_BAD_ARGS);
-	}
-
 	/*
 	 * We fetch the schema here, rather than later in the clone subprocess,
 	 * which simply reuses this cached data. This is done to avoid lock
@@ -865,6 +864,12 @@ cli_follow(int argc, char **argv)
 {
 	CopyDataSpec copySpecs = { 0 };
 
+	if (!cli_validate_wal_workers(&copyDBoptions))
+	{
+		/* errors have already been logged */
+		exit(EXIT_CODE_BAD_ARGS);
+	}
+
 	(void) cli_copy_prepare_specs(&copySpecs, DATA_SECTION_ALL);
 
 	/*
@@ -923,13 +928,6 @@ cli_follow(int argc, char **argv)
 	{
 		/* errors have already been logged */
 		exit(EXIT_CODE_INTERNAL_ERROR);
-	}
-
-	/* step F4 of the WAL workers plan replaces this refusal */
-	if (copySpecs.walWorkers > 1)
-	{
-		log_fatal("WAL workers are not implemented yet");
-		exit(EXIT_CODE_BAD_ARGS);
 	}
 
 	/*

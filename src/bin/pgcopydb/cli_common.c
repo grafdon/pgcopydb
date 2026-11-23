@@ -518,9 +518,10 @@ cli_validate_wal_high_traffic_tables(CopyDBOptions *options)
 
 /*
  * cli_validate_wal_workers refuses option combinations that WAL workers do not
- * support, once options, environment and the previous run are merged.
+ * support, once options, environment and the previous run are merged. Only
+ * clone and follow call it: other commands ignore these options.
  */
-static bool
+bool
 cli_validate_wal_workers(CopyDBOptions *options)
 {
 	int n = options->walWorkers;
@@ -781,12 +782,6 @@ cli_read_previous_options(CopyDBOptions *options, CopyFilePaths *cfPaths)
 				options->slot.slotName,
 				sizeof(options->slot.publicationName));
 		options->slot.publicationAutoManaged = true;
-	}
-
-	if (!cli_validate_wal_workers(options))
-	{
-		/* errors have already been logged */
-		return false;
 	}
 
 	return true;

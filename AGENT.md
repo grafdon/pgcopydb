@@ -76,6 +76,12 @@ pgcopydb clone
     ├── stream receive   (ld_stream.c)        → writes *-output.db
     └── stream apply     (ld_apply.c)         → inline transform (ld_transform.c)
                                                  → *-replay.db, then apply to target
+
+pgcopydb clone --follow --wal-workers N  (N > 1, follow.c follow_supervise_workers)
+└── follow supervisor                         syncs endpos/apply down, lowest LSNs up
+    └── follow worker <k>  (k = 0 .. N-1)     own catalog and CDC files in cdc/w<k>/
+        ├── stream receive                    slot S or S_w<k>, publications S_t<oid>
+        └── stream apply                      origin O or O_w<k>
 ```
 
 (2-process CDC: the former standalone `stream transform` step is now performed

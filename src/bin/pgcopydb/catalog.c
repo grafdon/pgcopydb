@@ -3485,6 +3485,152 @@ catalog_wal_worker_publications(DatabaseCatalog *catalog,
 
 
 /*
+ * catalog_copy_wal_worker_rows runs one INSERT ... SELECT from the attached
+ * main catalog, and fails unless it copied exactly the expected row count.
+ */
+static bool
+catalog_copy_wal_worker_rows(DatabaseCatalog *worker, char *sql,
+							 BindParam *params, int count, int expected)
+{
+	SQLiteQuery query = { 0 };
+
+	if (!catalog_sql_prepare(worker->db, sql, &query) ||
+		(count > 0 && !catalog_sql_bind(&query, params, count)) ||
+		!catalog_sql_execute_once(&query))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	if (expected >= 0 && sqlite3_changes(worker->db) != expected)
+	{
+		log_error("Failed to copy %d row(s) to \"%s\", copied %d: %s",
+				  expected, worker->dbfile, sqlite3_changes(worker->db), sql);
+		return false;
+	}
+
+	return true;
+}
+
+
+/*
+ * catalog_copy_wal_worker_catalog fills the empty catalog of a WAL worker
+ * from the main catalog in one transaction, sentinel last: a worker catalog
+ * is complete once sentinel_get succeeds on it.
+ */
+bool
+catalog_copy_wal_worker_catalog(DatabaseCatalog *worker,
+								DatabaseCatalog *source,
+								const char *cdcDir,
+								const char *workerDir,
+								const ReplicationSlot *slot)
+{
+	char *tablesSQL[] = {
+		"insert into main.s_table"
+		"  (oid, datname, qname, nspname, relname, amname, restore_list_name,"
+		"   relpages, reltuples, exclude_data, part_key) "
+		"select oid, datname, qname, nspname, relname, amname, restore_list_name,"
+		"       relpages, reltuples, exclude_data, part_key "
+		"  from parent.s_table",
+
+		"insert into main.s_attr"
+		"  (oid, attnum, attypid, attname, attisprimary, attisreplident,"
+		"   attisgenerated, attidentity, attisbinarycompatible, atttypsend) "
+		"select oid, attnum, attypid, attname, attisprimary, attisreplident,"
+		"       attisgenerated, attidentity, attisbinarycompatible, atttypsend "
+		"  from parent.s_attr",
+
+		"insert into main.s_table_size(oid, bytes, bytes_pretty) "
+		"select oid, bytes, bytes_pretty from parent.s_table_size",
+
+		"insert into main.s_table_part"
+		"  (oid, partnum, partcount, min, max, count) "
+		"select oid, partnum, partcount, min, max, count "
+		"  from parent.s_table_part",
+
+		"insert into main.timeline_history(tli, startpos, endpos) "
+		"select tli, startpos, endpos from parent.timeline_history",
+
+		"insert into main.wal_worker_table"
+		"  (oid, nspname, relname, family, weight, bytes, worker) "
+		"select oid, nspname, relname, family, weight, bytes, worker "
+		"  from parent.wal_worker_table"
+	};
+
+	/* the first output.db of the main dir, moved to the worker dir */
+	char *cdcFilesSQL =
+		"insert into main.cdc_files"
+		"  (filename, timeline, startpos, start_time_epoch) "
+		"select $1 || substr(filename, length($2) + 1),"
+		"       timeline, startpos, start_time_epoch "
+		"  from parent.cdc_files "
+		" where substr(filename, 1, length($2) + 1) = $2 || '/' "
+		"order by id "
+		"   limit 1";
+
+	char *sentinelSQL =
+		"insert into main.sentinel"
+		"  (id, startpos, endpos, apply, write_lsn, flush_lsn, replay_lsn) "
+		"select id, startpos, endpos, apply, write_lsn, flush_lsn, replay_lsn "
+		"  from parent.sentinel";
+
+	BindParam dirParams[] = {
+		{ BIND_PARAMETER_TYPE_TEXT, "worker_dir", 0, (char *) workerDir },
+		{ BIND_PARAMETER_TYPE_TEXT, "cdc_dir", 0, (char *) cdcDir }
+	};
+
+	if (!semaphore_lock(&(worker->sema)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	if (!catalog_attach(worker, source, "parent"))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(worker->sema));
+		return false;
+	}
+
+	bool success = catalog_begin(worker, true);
+
+	if (success)
+	{
+		int count = sizeof(tablesSQL) / sizeof(tablesSQL[0]);
+
+		for (int i = 0; success && i < count; i++)
+		{
+			success =
+				catalog_copy_wal_worker_rows(worker, tablesSQL[i], NULL, 0, -1);
+		}
+
+		success = success &&
+				  catalog_copy_wal_worker_rows(worker, cdcFilesSQL,
+											   dirParams, 2, 1) &&
+				  catalog_write_replication_slot(worker, slot) &&
+				  catalog_copy_wal_worker_rows(worker, sentinelSQL, NULL, 0, 1);
+
+		if (success)
+		{
+			success = catalog_commit(worker);
+		}
+		else
+		{
+			log_error("Failed to copy catalog \"%s\" to \"%s\"",
+					  source->dbfile, worker->dbfile);
+			(void) catalog_rollback(worker);
+		}
+	}
+
+	success = catalog_execute(worker, "detach parent") && success;
+
+	(void) semaphore_unlock(&(worker->sema));
+
+	return success;
+}
+
+
+/*
  * catalog_register_section registers that a section has been cached to the
  * internal catalogs.
  */

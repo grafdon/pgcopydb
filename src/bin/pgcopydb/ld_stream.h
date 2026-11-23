@@ -734,6 +734,7 @@ struct StreamSpecs
 
 	int walWorkers;
 	bool walWorker;             /* this process is one of walWorkers */
+	pid_t walSupervisor;        /* a worker quits once this pid is gone */
 
 	/*
 	 * User-specified source filters.  For pgoutput the publication is created
