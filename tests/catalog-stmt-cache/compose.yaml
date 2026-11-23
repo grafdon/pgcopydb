@@ -2,7 +2,7 @@ services:
   test:
     image: catalog-stmt-cache
     build:
-      # the build stage keeps the objects that stmt-cache.c links against
+      # the build stage keeps the objects the test programs link against
       context: ../..
       target: build
       args:

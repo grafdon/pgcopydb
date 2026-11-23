@@ -1022,7 +1022,7 @@ parsePgoutputMessage(StreamContext *privateContext,
 	SQLiteQuery query = { 0 };
 	query.errorOnZeroRows = false;
 
-	if (!catalog_sql_prepare(db, sql, &query))
+	if (!catalog_sql_prepare_cached(outputDB, sql, &query))
 	{
 		return false;
 	}
@@ -1137,7 +1137,7 @@ parsePgoutputMessage(StreamContext *privateContext,
 	char relname[PG_NAMEDATALEN] = { 0 };
 	char old_type = 0;
 
-	if (catalog_sql_prepare(db, nspsql, &nsq))
+	if (catalog_sql_prepare_cached(outputDB, nspsql, &nsq))
 	{
 		BindParam nsp_params[1] = {
 			{ BIND_PARAMETER_TYPE_INT64, "id", outputId, NULL }
