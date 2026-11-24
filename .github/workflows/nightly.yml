@@ -160,6 +160,7 @@ jobs:
           - cdc-endpos-before-txn
           - cdc-wal-workers
           - cdc-wal-workers-endpos
+          - cdc-wal-workers-fk
           - wal-workers-assign
         exclude:
           # timescaledb uses timescale/timescaledb:latest-pg13 for both source

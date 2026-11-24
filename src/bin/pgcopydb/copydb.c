@@ -442,6 +442,12 @@ copydb_prepare_dump_paths(CopyFilePaths *cfPaths, DumpPaths *dumpPaths)
 	sformat(dumpPaths->postListFilename, MAXPGPATH, "%s/%s",
 			cfPaths->schemadir, "post-filtered.list");
 
+	sformat(dumpPaths->fkListFilename, MAXPGPATH, "%s/%s",
+			cfPaths->schemadir, "fkeys-filtered.list");
+
+	sformat(dumpPaths->fkDoneFilename, MAXPGPATH, "%s/%s",
+			cfPaths->schemadir, "fkeys.done");
+
 	return true;
 }
 

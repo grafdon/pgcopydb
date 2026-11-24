@@ -807,6 +807,7 @@ clone_and_follow(CopyDataSpec *copySpecs)
 	if (!success)
 	{
 		log_warn("Failed to clone the source database, see above for details");
+		(void) follow_restore_fkeys(copySpecs, &streamSpecs, false);
 
 		if (!copydb_fatal_exit())
 		{
@@ -823,6 +824,8 @@ clone_and_follow(CopyDataSpec *copySpecs)
 		success = success &&
 				  cli_clone_follow_wait_subprocess("follow", followPID);
 	}
+
+	success = follow_restore_fkeys(copySpecs, &streamSpecs, success);
 
 	/*
 	 * Now is a good time to reset the sequences on the target database to
@@ -954,6 +957,13 @@ cli_follow(int argc, char **argv)
 				 LSN_FORMAT_ARGS(sentinel.endpos),
 				 LSN_FORMAT_ARGS(sentinel.replay_lsn));
 
+		/* a run stopped after endpos may have left the foreign keys */
+		if (!follow_restore_fkeys(&copySpecs, &specs, true))
+		{
+			/* errors have already been logged */
+			exit(EXIT_CODE_INTERNAL_ERROR);
+		}
+
 		exit(EXIT_CODE_QUIT);
 	}
 
@@ -981,7 +991,9 @@ cli_follow(int argc, char **argv)
 		exit(EXIT_CODE_SOURCE);
 	}
 
-	if (!follow_main_loop(&copySpecs, &specs))
+	bool success = follow_main_loop(&copySpecs, &specs);
+
+	if (!follow_restore_fkeys(&copySpecs, &specs, success))
 	{
 		/* errors have already been logged */
 		exit(EXIT_CODE_INTERNAL_ERROR);

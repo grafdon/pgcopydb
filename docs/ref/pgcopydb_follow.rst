@@ -539,6 +539,13 @@ The following options are available to ``pgcopydb follow``:
   A worker also stops when its supervisor exits, and on Linux its receive and apply processes stop when it exits.
   ``pgcopydb stream cleanup`` drops the slots, publications and origins of every worker.
 
+  The foreign keys stay off the target until every worker reached endpos, because the worker of a referenced table applies a TRUNCATE of that table without the tables of the other workers.
+  The post-data step leaves the foreign keys and their comments out, and once every worker reached endpos a second ``pg_restore`` pass creates and validates them, and keeps ``NOT VALID`` and ``NOT ENFORCED`` as on the source.
+  ``pgcopydb follow`` reads them from ``schema/schema.dump`` in the work directory, as ``pgcopydb clone`` writes it, and fails at endpos when that file is missing.
+  With a target that already has the foreign keys, as after ``pgcopydb clone`` without ``--follow``, a TRUNCATE of a referenced table on the source fails the worker of that table.
+  Exit 0 means that the foreign keys exist, and a command that stops before that, on a signal or an error, exits with an error and logs ``Foreign keys are pending``.
+  See :ref:`resuming_operations` for a rerun.
+
   A value above 1 requires a source running Postgres 13 or later, the pgoutput plugin, a publication that pgcopydb manages (no ``--publication``), no ``--all-databases``, a slot name of at most 51 bytes and an origin of at most 59 bytes.
   The slot name and the origin must not end in ``_w<digits>`` or ``_t<digits>``, because WAL workers name their own slots, origins and publications that way.
 

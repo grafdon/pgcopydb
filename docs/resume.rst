@@ -194,6 +194,15 @@ Otherwise run ``pgcopydb stream cleanup`` with the same ``--dir``, ``--slot-name
 A retry that creates a new replication slot copies under that slot's
 snapshot, even with ``--not-consistent``.
 
+Foreign keys with WAL workers
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+With ``--wal-workers`` above 1, the foreign keys are created only once every WAL worker reached endpos.
+A command that stops before that exits with an error and logs ``Foreign keys are pending``.
+Run it again with ``--resume``, and it creates the foreign keys once every worker reached endpos.
+The file ``schema/fkeys.done`` in the work directory records that they exist, so a rerun skips them.
+A command that stops while it creates them leaves no such file, and the next run drops the foreign keys it finds before it creates them all again.
+
 Snapshot and catalogs (cache invalidation)
 ------------------------------------------
 

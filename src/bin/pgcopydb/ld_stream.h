@@ -956,6 +956,8 @@ bool stream_replay_reached_endpos(StreamSpecs *specs,
 bool follow_export_snapshot(CopyDataSpec *copySpecs, StreamSpecs *streamSpecs);
 bool follow_setup_databases(CopyDataSpec *copySpecs, StreamSpecs *streamSpecs);
 bool follow_reset_sequences(CopyDataSpec *copySpecs, StreamSpecs *streamSpecs);
+bool follow_restore_fkeys(CopyDataSpec *copySpecs, StreamSpecs *streamSpecs,
+						  bool followed);
 
 bool wal_workers_assign(WalWorkerTable *tables, int count, int workers,
 						const char *highTraffic);

@@ -526,6 +526,7 @@ bool copydb_objectid_has_been_processed_already(CopyDataSpec *specs,
 
 bool copydb_write_restore_list(CopyDataSpec *specs, PostgresDumpSection section);
 bool copydb_write_schemas_restore_list(CopyDataSpec *specs);
+bool copydb_target_restore_fkeys(CopyDataSpec *specs);
 
 /* sequences.c */
 bool copydb_copy_all_sequences(CopyDataSpec *specs, bool reset);

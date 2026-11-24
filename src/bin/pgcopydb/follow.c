@@ -228,6 +228,39 @@ follow_reset_sequences(CopyDataSpec *copySpecs, StreamSpecs *streamSpecs)
 
 
 /*
+ * follow_restore_fkeys creates the foreign keys that WAL workers keep off the
+ * target once the run reached endpos, or logs that they are pending. With one
+ * worker, post-data created them and it returns followed.
+ */
+bool
+follow_restore_fkeys(CopyDataSpec *copySpecs, StreamSpecs *streamSpecs,
+					 bool followed)
+{
+	if (copySpecs->walWorkers <= 1)
+	{
+		return followed;
+	}
+
+	bool stopped = asked_to_stop || asked_to_stop_fast || asked_to_quit;
+	bool done = false;
+
+	if (followed && !stopped &&
+		catalog_open_from_specs(copySpecs) &&
+		follow_reached_endpos(streamSpecs, &done) &&
+		done &&
+		copydb_target_restore_fkeys(copySpecs))
+	{
+		return true;
+	}
+
+	log_warn("Foreign keys are pending: they are created once every WAL "
+			 "worker reached endpos, run the command again with --resume");
+
+	return false;
+}
+
+
+/*
  * follow_init_sentinel sets the sentinel endpos to the command line --endpos
  * option, when given.
  */
