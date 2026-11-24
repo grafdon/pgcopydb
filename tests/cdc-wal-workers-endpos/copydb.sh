@@ -360,16 +360,24 @@ for _ in $(seq 120); do
 done
 read -r txid p < <(sql "${SRC}" -F ' ' -c "select backend_xid, pg_current_wal_insert_lsn() from pg_stat_activity where application_name = 'ep_straddle' and state = 'idle in transaction'") ||
     fail 'T did not reach its COMMIT'
-E=$(sql "${SRC}" -c "select '${p}'::pg_lsn + 16384")
-pgcopydb stream sentinel set endpos --dir "${dir}" "${E}" > /dev/null
-wait_log 3 "endpos is now set to ${E}\$"
+
+# endpos goes inside the COMMIT record of T once it is written, so receive of
+# worker 1 stays stopped until then, and longer than its 10 s status interval,
+# at which it re-reads endpos before it handles another message
+worker_pids 1
+kill -STOP "${recv}"
+stopped=${SECONDS}
 echo 'commit;' >&4
 exec 4>&-
 wait "${tx}" || { cat /tmp/straddle.out; fail 'T failed'; }
-
 read -r c t_end < <(commit_record "${p}" "${txid}") || fail 'no COMMIT record of T'
+E=$(sql "${SRC}" -c "select '${c}'::pg_lsn + floor(('${t_end}'::pg_lsn - '${c}'::pg_lsn) / 2)")
 check "endpos ${E} inside the COMMIT record ${c} to ${t_end} of T" 't t' \
       "$(lsn_cmp "${c}" '<' "${E}") $(lsn_cmp "${E}" '<' "${t_end}")"
+pgcopydb stream sentinel set endpos --dir "${dir}" "${E}" > /dev/null
+wait_worker 1 endpos "${E}"
+while [ $((SECONDS - stopped)) -le 11 ]; do sleep 0.5; done
+kill -CONT "${recv}"
 wait_log 1 "WAL worker 1 with pid [0-9]+ has reached endpos ${E}\$"
 grep -F "Endpos ${E} lies inside the COMMIT record of xid ${txid} at ${c}" "${log}" ||
     fail 'receive did not see endpos inside the COMMIT record of T'

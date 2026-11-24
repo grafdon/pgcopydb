@@ -248,6 +248,14 @@ SQL
 
     check 'worker of rs.evt' 1 "$(lite "${dir}/schema/source.db" "select worker from wal_worker_table where nspname = 'rs' and relname = 'evt'")"
 
+    # the lost directory refusal needs this: an unmoved slot lets a resume
+    # rebuild the catalog, and receive reports at its 10 s status interval
+    w2_moved() { src -c "select confirmed_flush_lsn > '$(slot_lsn "${dir}")' from pg_replication_slots where slot_name = '${S}_w2'"; }
+    for _ in $(seq 60); do
+        [ "$(w2_moved)" = t ] && break
+        sleep 0.5
+    done
+
     # (a) apply of worker 1, once its COMMIT returned, before anything else
     wpid=$(pgrep -f '^pgcopydb: follow worker 1( |$)') || fail 'no WAL worker 1'
     apid=$(pgrep -P "${wpid}" -f '^pgcopydb: follow apply( |$)') || fail 'no apply of WAL worker 1'
@@ -263,8 +271,7 @@ SQL
            pgcopydb follow --resume --not-consistent --dir "${dir}" --wal-workers 2 --wal-high-traffic-tables rs.hot,rs.evt
     expect "${SOURCE}" 'this run uses --wal-workers 3 --wal-high-traffic-tables "rs.acct"' other-list \
            pgcopydb follow --resume --not-consistent --dir "${dir}" --wal-workers 3 --wal-high-traffic-tables rs.acct
-    check 'slot of worker 2 moved since its creation' t \
-          "$(src -c "select confirmed_flush_lsn > '$(slot_lsn "${dir}")' from pg_replication_slots where slot_name = '${S}_w2'")"
+    check 'slot of worker 2 moved since its creation' t "$(w2_moved)"
     mv "${dir}/cdc/w2" "${dir}/cdc-w2"
     expect "${INTERNAL}" 'is missing or incomplete' lost-dir \
            pgcopydb follow --resume --not-consistent --dir "${dir}" "${ww[@]}"
