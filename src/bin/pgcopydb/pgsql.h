@@ -605,6 +605,19 @@ bool pgsql_drop_wal_worker_publications(PGSQL *pgsql,
 										const char *slotName,
 										const char *names);
 
+/* the catalog and object oids of a pg_restore --list entry */
+typedef struct CatalogObject
+{
+	uint32_t catOid;
+	uint32_t objOid;
+} CatalogObject;
+
+bool pgsql_list_publication_objects(PGSQL *pgsql,
+									const char *name,
+									bool walWorkers,
+									CatalogObject **objects,
+									int *count);
+
 bool pgsql_role_exists(PGSQL *pgsql, const char *roleName, bool *exists);
 
 bool pgsql_configuration_exists(PGSQL *pgsql, const char *setconfig, bool *exists);

@@ -68,6 +68,7 @@ typedef struct DumpPaths
 
 	char fkListFilename[MAXPGPATH];  /* foreign keys only, after endpos */
 	char fkDoneFilename[MAXPGPATH];  /* foreign keys have been created */
+	char ownPubsFilename[MAXPGPATH]; /* publications follow made, at the snapshot */
 } DumpPaths;
 
 

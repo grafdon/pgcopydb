@@ -6111,6 +6111,122 @@ pgsql_drop_wal_worker_publications(PGSQL *pgsql, const char *slotName,
 }
 
 
+typedef struct CatalogObjectsContext
+{
+	CatalogObject *objects;
+	int count;
+	bool parsedOk;
+} CatalogObjectsContext;
+
+
+static void
+catalog_objects_parse(void *ctx, PGresult *result)
+{
+	CatalogObjectsContext *context = (CatalogObjectsContext *) ctx;
+	int nTuples = PQntuples(result);
+
+	/* one more slot keeps calloc away from a zero size */
+	context->objects = calloc(nTuples + 1, sizeof(CatalogObject));
+
+	if (context->objects == NULL)
+	{
+		log_error(ALLOCATION_FAILED_ERROR);
+		return;
+	}
+
+	for (int i = 0; i < nTuples; i++)
+	{
+		CatalogObject *object = &(context->objects[i]);
+
+		if (!stringToUInt32(PQgetvalue(result, i, 0), &(object->catOid)) ||
+			!stringToUInt32(PQgetvalue(result, i, 1), &(object->objOid)))
+		{
+			log_error("Failed to parse publication object oids \"%s\" \"%s\"",
+					  PQgetvalue(result, i, 0),
+					  PQgetvalue(result, i, 1));
+			return;
+		}
+	}
+
+	context->count = nTuples;
+	context->parsedOk = true;
+}
+
+
+/*
+ * pgsql_list_publication_objects lists, ordered for bsearch, the catalog and
+ * object oids that pg_restore --list shows for the publication name, or with
+ * walWorkers for the publications <name>_t<digits>. The caller frees *objects.
+ */
+bool
+pgsql_list_publication_objects(PGSQL *pgsql, const char *name, bool walWorkers,
+							   CatalogObject **objects, int *count)
+{
+	char *match = walWorkers
+				  ? WAL_WORKER_NAME_MATCH("p.pubname", "t")
+				  : "p.pubname::text = $1";
+
+	if (!pgsql_server_version(pgsql))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	PQExpBuffer sql = createPQExpBuffer();
+
+	if (sql == NULL)
+	{
+		log_error(ALLOCATION_FAILED_ERROR);
+		return false;
+	}
+
+	appendPQExpBuffer(sql,
+					  "select p.tableoid, p.oid from pg_publication p where %s "
+					  "union all "
+					  "select r.tableoid, r.oid from pg_publication_rel r "
+					  "  join pg_publication p on p.oid = r.prpubid where %s ",
+					  match, match);
+
+	/* TABLES IN SCHEMA came with Postgres 15 */
+	if (pgsql->pgversion_num >= 150000)
+	{
+		appendPQExpBuffer(sql,
+						  "union all "
+						  "select n.tableoid, n.oid from pg_publication_namespace n "
+						  "  join pg_publication p on p.oid = n.pnpubid where %s ",
+						  match);
+	}
+
+	appendPQExpBufferStr(sql, "order by 1, 2");
+
+	Oid paramTypes[1] = { TEXTOID };
+	const char *paramValues[1] = { name };
+	CatalogObjectsContext context = { 0 };
+
+	bool success =
+		!PQExpBufferBroken(sql) &&
+		pgsql_execute_with_params(pgsql, sql->data, 1, paramTypes, paramValues,
+								  &context, &catalog_objects_parse);
+
+	destroyPQExpBuffer(sql);
+
+	if (!success || !context.parsedOk)
+	{
+		log_error(walWorkers
+				  ? "Failed to list the objects of the publications \"%s_t<digits>\""
+				  : "Failed to list the objects of the publication \"%s\"",
+				  name);
+		free(context.objects);
+		return false;
+	}
+
+	*objects = context.objects;
+	*count = context.count;
+
+	return true;
+}
+
+
 /*
  * pgsql_table_exists checks that a table with the given name exists on the
  * Postgres server.
