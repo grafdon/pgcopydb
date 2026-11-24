@@ -5778,8 +5778,11 @@ pgsql_copy_logical_replication_slot(PGSQL *pgsql, const char *srcName,
 		log_error("Failed to parse LSN \"%s\" of replication slot \"%s\"",
 				  context.strVal == NULL ? "" : context.strVal,
 				  dstName);
+		free(context.strVal);
 		return false;
 	}
+
+	free(context.strVal);
 
 	log_info("Copied replication slot \"%s\" to \"%s\" at %X/%X",
 			 srcName, dstName, LSN_FORMAT_ARGS(*lsn));
@@ -5839,16 +5842,20 @@ pgsql_check_wal_worker_slot(PGSQL *pgsql, const char *slotName, uint64_t lsn)
 	if (!context.parsedOk || context.isNull)
 	{
 		log_error("Failed to check replication slot \"%s\"", slotName);
+		free(context.strVal);
 		return false;
 	}
 
-	if (*context.strVal != '\0')
+	bool usable = *context.strVal == '\0';
+
+	if (!usable)
 	{
 		log_error("Replication slot \"%s\" %s", slotName, context.strVal);
-		return false;
 	}
 
-	return true;
+	free(context.strVal);
+
+	return usable;
 }
 
 
@@ -6087,10 +6094,12 @@ pgsql_drop_wal_worker_publications(PGSQL *pgsql, const char *slotName,
 	if (drop == NULL)
 	{
 		log_error(ALLOCATION_FAILED_ERROR);
+		free(context.strVal);
 		return false;
 	}
 
 	appendPQExpBuffer(drop, "DROP PUBLICATION IF EXISTS %s", context.strVal);
+	free(context.strVal);
 
 	bool success = pgsql_execute(pgsql, drop->data);
 

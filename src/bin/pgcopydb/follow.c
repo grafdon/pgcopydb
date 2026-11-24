@@ -1467,6 +1467,14 @@ wal_workers_assign_units(WalWorkerTable *tables, int count,
 		{
 			int other = unit->worker;
 
+			if (lengths[other] == len && strncmp(entries[other], entry, len) == 0)
+			{
+				log_error("Option --wal-high-traffic-tables lists \"%.*s\" "
+						  "more than once",
+						  len, entry);
+				return false;
+			}
+
 			log_error("Option --wal-high-traffic-tables entries \"%.*s\" and "
 					  "\"%.*s\" are in the same partition family",
 					  lengths[other], entries[other], len, entry);

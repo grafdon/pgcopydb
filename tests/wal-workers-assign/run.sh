@@ -30,4 +30,12 @@ done
 "${cc[@]}" -I. -c "${here}/assign.c" -o /tmp/assign.o
 "${cc[@]}" /tmp/assign.o /tmp/main.o "${objs[@]}" "${libs[@]}" -o /tmp/assign
 
-ASAN_OPTIONS=${ASAN_OPTIONS:-detect_leaks=0} /tmp/assign
+rc=0
+ASAN_OPTIONS=${ASAN_OPTIONS:-detect_leaks=0} /tmp/assign > /tmp/assign.log 2>&1 || rc=$?
+cat /tmp/assign.log
+test "${rc}" -eq 0
+
+# the duplicate gets its own message, not the partition family one
+grep -qF 'lists "s.t" more than once' /tmp/assign.log
+if grep -qF 'entries "s.t" and "s.t"' /tmp/assign.log; then exit 1; fi
+echo 'PASS: a duplicated high-traffic entry is named as such'

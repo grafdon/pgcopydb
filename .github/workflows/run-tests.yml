@@ -165,6 +165,8 @@ jobs:
           - cdc-wal-workers
           - cdc-wal-workers-endpos
           - cdc-wal-workers-fk
+          - cdc-wal-workers-resume
+          - cdc-wal-workers-idle
           - wal-workers-assign
         exclude:
           # timescaledb uses timescale/timescaledb:latest-pg13 for both source
@@ -247,6 +249,10 @@ jobs:
           - TEST: cdc-wal-workers-endpos
             PGVERSION: 16
           - TEST: cdc-wal-workers-fk
+            PGVERSION: 16
+          - TEST: cdc-wal-workers-resume
+            PGVERSION: 16
+          - TEST: cdc-wal-workers-idle
             PGVERSION: 16
           - TEST: wal-workers-assign
             PGVERSION: 16

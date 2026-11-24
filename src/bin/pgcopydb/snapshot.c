@@ -477,6 +477,46 @@ copydb_check_reused_wal_workers(CopyDataSpec *copySpecs, ReplicationSlot *slot)
 
 
 /*
+ * copydb_check_no_wal_workers refuses a fresh setup over the assignment of an
+ * earlier attempt that never recorded its slot: replacing it would hide the
+ * worker slots of that attempt from stream cleanup.
+ */
+static bool
+copydb_check_no_wal_workers(CopyDataSpec *copySpecs, ReplicationSlot *slot)
+{
+	int workers = 0;
+	char highTraffic[WAL_HIGH_TRAFFIC_TABLES_BUFSIZE] = { 0 };
+	bool found = false;
+
+	if (!catalog_read_wal_worker_setup(&(copySpecs->catalogs.source),
+									   &workers,
+									   highTraffic,
+									   sizeof(highTraffic),
+									   &found))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	if (found)
+	{
+		log_fatal("Failed to create replication slot \"%s\": an earlier "
+				  "attempt set up --wal-workers %d in catalog \"%s\" and "
+				  "stopped before it recorded the slot",
+				  slot->slotName,
+				  workers,
+				  copySpecs->catalogs.source.dbfile);
+		log_info("Run pgcopydb stream cleanup with the same --dir, "
+				 "--slot-name and --origin as that attempt, then start over "
+				 "with --restart");
+		return false;
+	}
+
+	return true;
+}
+
+
+/*
  * copydb_prepare_wal_workers assigns the tables to publish to WAL workers,
  * stores the assignment, then creates one publication per table.
  */
@@ -604,6 +644,12 @@ copydb_create_logical_replication_slot(CopyDataSpec *copySpecs,
 				  "the replication protocol command CREATE_REPLICATION_SLOT",
 				  sourceSnapshot->snapshot);
 		log_info("Consider using pgcopydb snapshot --follow");
+		return false;
+	}
+
+	if (!copydb_check_no_wal_workers(copySpecs, slot))
+	{
+		/* errors have already been logged */
 		return false;
 	}
 

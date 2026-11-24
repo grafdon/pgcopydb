@@ -82,6 +82,14 @@ test_assign(void)
 	expect("heaviest first, ties by bytes, count and family oid",
 		   ties, 5, 3, "", (int[]) { 0, 2, 1, 2, 1 });
 
+	/* equal weight and bytes: the family of three tables sorts first */
+	WalWorkerTable count[] = {
+		T(70, "single", 0, 10, 0), T(80, "root", 0, 0, 0),
+		T(81, "p_1", 80, 5, 0), T(82, "p_2", 80, 5, 0)
+	};
+	expect("ties on weight and bytes go by table count before family oid",
+		   count, 4, 2, "", (int[]) { 1, 0, 0, 0 });
+
 	WalWorkerTable fewer[] = {
 		T(20, "hot", 0, 1, 0), T(21, "a", 0, 100, 0),
 		T(22, "b", 0, 50, 0), T(23, "c", 0, 40, 0)
@@ -111,6 +119,7 @@ test_assign(void)
 	refuse("an entry matching no table", family, 4, 2, "s.missing");
 	refuse("an entry differing in case", family, 4, 2, "S.t");
 	refuse("an entry without a schema", family, 4, 2, "t");
+	refuse("a prefix of a table name", family, 4, 2, "s.ro");
 	refuse("an empty entry", family, 4, 2, "s.t,");
 	refuse("two entries in one family", family, 4, 2, "s.p_1,s.p_2");
 	refuse("one entry twice", family, 4, 3, "s.t,s.t");
@@ -120,6 +129,10 @@ test_assign(void)
 
 	WalWorkerTable twins[] = { T(60, "t", 0, 1, 0), T(61, "t", 0, 1, 0) };
 	refuse("an entry matching two tables", twins, 2, 2, "s.t");
+
+	WalWorkerTable schemas[] = { T(62, "u", 0, 1, 0), T(63, "v", 0, 1, 0) };
+	strlcpy(schemas[0].nspname, "sx", sizeof(schemas[0].nspname));
+	refuse("a prefix of a schema name", schemas, 2, 2, "s.u");
 }
 
 

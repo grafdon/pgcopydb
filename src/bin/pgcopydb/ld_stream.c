@@ -2479,6 +2479,18 @@ stream_cleanup_databases(CopyDataSpec *copySpecs, char *slotName, char *origin)
 {
 	PGSQL src = { 0 };
 	PGSQL dst = { 0 };
+	DatabaseCatalog *sourceDB = &(copySpecs->catalogs.source);
+	ReplicationSlot slot = { 0 };
+
+	/* a failed read must not pass for a catalog without a slot row */
+	if (sourceDB->db != NULL &&
+		!catalog_read_replication_slot(sourceDB, &slot))
+	{
+		log_error("Failed to read the replication slot from catalog \"%s\", "
+				  "nothing was cleaned up",
+				  sourceDB->dbfile);
+		return false;
+	}
 
 	/*
 	 * Cleanup the source database (replication slot, pgcopydb sentinel).
@@ -2502,23 +2514,19 @@ stream_cleanup_databases(CopyDataSpec *copySpecs, char *slotName, char *origin)
 	}
 
 	/*
-	 * If we auto-created a pgoutput publication, drop it now.
-	 * Read the slot metadata from the source catalog to find the name.
+	 * If we auto-created a pgoutput publication, drop it now. The slot
+	 * metadata read from the source catalog has its name.
 	 */
-	ReplicationSlot slot = { 0 };
-	if (catalog_read_replication_slot(&(copySpecs->catalogs.source), &slot))
+	if (slot.publicationAutoManaged &&
+		!IS_EMPTY_STRING_BUFFER(slot.publicationName))
 	{
-		if (slot.publicationAutoManaged &&
-			!IS_EMPTY_STRING_BUFFER(slot.publicationName))
+		PGSQL pubconn = { 0 };
+		if (pgsql_init(&pubconn,
+					   copySpecs->connStrings.source_pguri,
+					   PGSQL_CONN_SOURCE))
 		{
-			PGSQL pubconn = { 0 };
-			if (pgsql_init(&pubconn,
-						   copySpecs->connStrings.source_pguri,
-						   PGSQL_CONN_SOURCE))
-			{
-				(void) pgsql_drop_publication(&pubconn, slot.publicationName);
-				(void) pgsql_finish(&pubconn);
-			}
+			(void) pgsql_drop_publication(&pubconn, slot.publicationName);
+			(void) pgsql_finish(&pubconn);
 		}
 	}
 
@@ -2527,7 +2535,6 @@ stream_cleanup_databases(CopyDataSpec *copySpecs, char *slotName, char *origin)
 	 * a slot row lost track of them, so they go by name pattern. A one-worker
 	 * run has none.
 	 */
-	DatabaseCatalog *sourceDB = &(copySpecs->catalogs.source);
 	char highTraffic[WAL_HIGH_TRAFFIC_TABLES_BUFSIZE] = { 0 };
 	int workers = 0;
 	bool found = false;
