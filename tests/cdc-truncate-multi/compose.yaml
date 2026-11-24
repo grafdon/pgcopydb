@@ -29,6 +29,7 @@ services:
     environment:
       PGCOPYDB_TABLE_JOBS: 2
       PGCOPYDB_INDEX_JOBS: 2
+      PGCOPYDB_WAL_WORKERS:
     depends_on:
       - source
       - target

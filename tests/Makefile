@@ -16,7 +16,9 @@ all: pagila pagila-multi-steps blobs unit filtering extensions \
 	 cdc-truncate-multi cdc-copy-multi-insert cdc-origin-abort \
 	 cdc-receive-drain-error cdc-receive-reconnect-dying-source \
 	 cdc-receive-status-interval cdc-apply-wakeup catalog-stmt-cache \
-	 cdc-receive-group-commit cdc-endpos-before-txn \
+	 cdc-receive-group-commit cdc-endpos-before-txn cdc-wal-workers \
+	 cdc-wal-workers-endpos cdc-wal-workers-fk cdc-wal-workers-resume \
+	 cdc-wal-workers-idle wal-workers-assign \
 	 follow-wal2json follow-9.6 follow-data-only \
 	 follow-pgoutput follow-filtering follow-resume-snapshot \
 	 orphaned-target-backend split-table-resume \
@@ -98,6 +100,21 @@ cdc-pgoutput-resume: build
 cdc-keepalive: build
 	$(MAKE) -C $@
 
+cdc-wal-workers: build
+	$(MAKE) -C $@
+
+cdc-wal-workers-endpos: build
+	$(MAKE) -C $@
+
+cdc-wal-workers-fk: build
+	$(MAKE) -C $@
+
+cdc-wal-workers-resume: build
+	$(MAKE) -C $@
+
+cdc-wal-workers-idle: build
+	$(MAKE) -C $@
+
 cdc-filtering-pgoutput: build
 	$(MAKE) -C $@
 
@@ -139,6 +156,10 @@ cdc-endpos-before-txn: build
 
 # builds its own image from the build stage of the top-level Dockerfile
 catalog-stmt-cache:
+	$(MAKE) -C $@
+
+# builds its own image from the build stage of the top-level Dockerfile
+wal-workers-assign:
 	$(MAKE) -C $@
 
 follow-pgoutput: build
@@ -216,7 +237,9 @@ clean-images:
 .PHONY: cdc-interleaved-commits cdc-resend-after-reconnect cdc-commit-order-resume
 .PHONY: cdc-truncate-multi cdc-copy-multi-insert cdc-origin-abort cdc-receive-drain-error
 .PHONY: cdc-receive-reconnect-dying-source cdc-receive-status-interval cdc-apply-wakeup
-.PHONY: catalog-stmt-cache cdc-receive-group-commit cdc-endpos-before-txn
+.PHONY: catalog-stmt-cache cdc-receive-group-commit cdc-endpos-before-txn cdc-wal-workers
+.PHONY: cdc-wal-workers-endpos cdc-wal-workers-fk cdc-wal-workers-resume
+.PHONY: cdc-wal-workers-idle wal-workers-assign
 .PHONY: follow-wal2json follow-9.6 follow-resume-snapshot orphaned-target-backend split-table-resume
 .PHONY: all-databases-resume large-objects-resume json-logs
 .PHONY: defer-indexes defer-indexes-queue defer-indexes-all-databases

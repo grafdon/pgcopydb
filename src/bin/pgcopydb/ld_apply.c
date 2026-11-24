@@ -77,6 +77,11 @@ static bool stream_apply_group_open(StreamApplyContext *context);
 static bool stream_apply_group_rollback(StreamApplyContext *context);
 static bool stream_apply_group_close(StreamApplyContext *context,
 									 PipelineStateEntry *current);
+static bool stream_apply_finish_wal_worker(StreamSpecs *specs,
+										   StreamApplyContext *context,
+										   bool *finished);
+static bool stream_apply_commit(StreamApplyContext *context, uint64_t lsn,
+								char *timestamp);
 static bool stream_apply_txn_body(StreamApplyContext *context,
 								  uint32_t xid,
 								  uint64_t begin_id,
@@ -156,12 +161,305 @@ stream_apply_catchup(StreamSpecs *specs)
 	(void) pipeline_state_start(specs->sourceDB, "apply", context.previousLSN);
 
 	bool success = stream_apply_replaydb(specs, &context);
+	bool done = success;
 
-	(void) pipeline_state_end(specs->sourceDB, "apply",
-							  context.previousLSN, success);
+	/* a WAL worker records done only once it finished at endpos */
+	if (success && specs->walWorker)
+	{
+		success = stream_apply_finish_wal_worker(specs, &context, &done);
+		done = success && done;
+	}
+
+	/* a WAL worker done at endpos may keep its origin below it */
+	uint64_t endLSN =
+		specs->walWorker && done ? context.stopEndpos : context.previousLSN;
+
+	(void) pipeline_state_end(specs->sourceDB, "apply", endLSN, done);
 	(void) stream_apply_cleanup(&context);
 
 	return success;
+}
+
+
+/* stream_apply_stopping is true once a signal asked the apply to stop */
+static bool
+stream_apply_stopping(void)
+{
+	return asked_to_stop || asked_to_stop_fast || asked_to_quit;
+}
+
+
+/* how many 100 ms passes a WAL worker waits for its slot to be released */
+#define APPLY_SLOT_RELEASE_WAIT 300
+
+
+/*
+ * stream_apply_advance_wal_worker_slot waits until the walsender of receive
+ * let go of the slot of this WAL worker, then advances the slot to lsn.
+ */
+static bool
+stream_apply_advance_wal_worker_slot(StreamSpecs *specs, uint64_t lsn,
+									 bool *advanced)
+{
+	PGSQL src = { 0 };
+	uint64_t slotLSN = InvalidXLogRecPtr;
+	char *slotName = specs->slot.slotName;
+
+	*advanced = false;
+
+	if (!pgsql_init(&src, specs->connStrings->source_pguri, PGSQL_CONN_SOURCE))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	/* the walsender exits once it reads the end of the closed connection */
+	bool success = true;
+
+	for (int i = 0; success && slotLSN == InvalidXLogRecPtr; i++)
+	{
+		if (stream_apply_stopping())
+		{
+			(void) pgsql_finish(&src);
+			return true;
+		}
+
+		success = pgsql_replication_slot_inactive_lsn(&src, slotName, &slotLSN);
+
+		if (success && slotLSN == InvalidXLogRecPtr)
+		{
+			if (i == APPLY_SLOT_RELEASE_WAIT)
+			{
+				log_error("Failed to advance replication slot \"%s\" to "
+						  "%X/%X: a walsender still uses it after %d s",
+						  slotName,
+						  LSN_FORMAT_ARGS(lsn),
+						  APPLY_SLOT_RELEASE_WAIT / 10);
+				success = false;
+				break;
+			}
+
+			pg_usleep(100 * 1000);
+		}
+	}
+
+	if (success && slotLSN < lsn)
+	{
+		success = pgsql_replication_slot_advance(&src, slotName, lsn, &slotLSN);
+	}
+
+	(void) pgsql_finish(&src);
+
+	if (!success)
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	if (slotLSN < lsn)
+	{
+		log_error("Failed to advance replication slot \"%s\" to %X/%X: "
+				  "it is at %X/%X",
+				  slotName,
+				  LSN_FORMAT_ARGS(lsn),
+				  LSN_FORMAT_ARGS(slotLSN));
+		return false;
+	}
+
+	if (slotLSN > lsn)
+	{
+		log_warn("Replication slot \"%s\" is at %X/%X, past %X/%X",
+				 slotName,
+				 LSN_FORMAT_ARGS(slotLSN),
+				 LSN_FORMAT_ARGS(lsn));
+	}
+
+	*advanced = true;
+
+	return true;
+}
+
+
+/*
+ * stream_apply_wait_upstream_done waits for the done signal of receive, or a
+ * stop signal. Receive signals before it records 'done', or not at all, and
+ * the follow process keeps the write end open: EOF never ends this wait.
+ */
+static bool
+stream_apply_wait_upstream_done(StreamSpecs *specs)
+{
+	int pipe_rd = specs->pipe_rt[0];
+
+	while (!specs->upstream_done && pipe_rd > 0 && !stream_apply_stopping())
+	{
+		PipelineStateEntry receive = { 0 };
+
+		bool running =
+			!pipeline_state_get(specs->sourceDB, "receive", &receive) ||
+			streq(receive.run_state, "running");
+
+		fd_set rfds;
+		FD_ZERO(&rfds);
+		FD_SET(pipe_rd, &rfds);
+		struct timeval tv = { .tv_sec = 0, .tv_usec = running ? 100 * 1000 : 0 };
+
+		int nready = select(pipe_rd + 1, &rfds, NULL, NULL, &tv);
+
+		if (nready < 0 && errno != EINTR)
+		{
+			log_error("apply select() on pipe: %m");
+			return false;
+		}
+
+		if (nready > 0 && FD_ISSET(pipe_rd, &rfds))
+		{
+			(void) stream_recv_upstream_done(specs, pipe_rd);
+		}
+		else if (!running)
+		{
+			break;
+		}
+	}
+
+	return true;
+}
+
+
+/*
+ * stream_apply_finish_wal_worker moves the slot and origin of a WAL worker to
+ * the endpos its loop stopped at, or to where a COMMIT record spanning it
+ * starts, only when this run drained there. Then it sets finished.
+ */
+static bool
+stream_apply_finish_wal_worker(StreamSpecs *specs,
+							   StreamApplyContext *context,
+							   bool *finished)
+{
+	uint64_t endpos = context->stopEndpos;
+
+	*finished = false;
+
+	if (stream_apply_stopping() ||
+		!context->reachedEndPos ||
+		endpos == InvalidXLogRecPtr)
+	{
+		return true;
+	}
+
+	if (endpos < context->previousLSN)
+	{
+		log_warn("Apply committed up to %X/%X, past endpos %X/%X: "
+				 "not moving origin \"%s\" to endpos",
+				 LSN_FORMAT_ARGS(context->previousLSN),
+				 LSN_FORMAT_ARGS(endpos),
+				 context->origin);
+		return true;
+	}
+
+	if (!stream_apply_wait_upstream_done(specs))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	if (stream_apply_stopping())
+	{
+		return true;
+	}
+
+	/* receive signals no LSN after a signal */
+	if (!specs->upstream_done ||
+		specs->upstream_done_lsn < endpos ||
+		specs->upstream_confirm_lsn == InvalidXLogRecPtr)
+	{
+		log_warn("Receive stopped at %X/%X, before endpos %X/%X: "
+				 "not moving origin \"%s\" to endpos",
+				 LSN_FORMAT_ARGS(specs->upstream_done_lsn),
+				 LSN_FORMAT_ARGS(endpos),
+				 context->origin);
+		return true;
+	}
+
+	ReplayDBOutputMessage pending = { 0 };
+
+	if (!ld_store_lookup_output_complete_txn(specs->outputDB,
+											 context->previousLSN,
+											 endpos,
+											 &pending))
+	{
+		log_error("Failed to look up the transactions left to apply "
+				  "in outputDB, see above for details");
+		return false;
+	}
+
+	if (pending.lsn != InvalidXLogRecPtr)
+	{
+		log_error("Apply stopped at %X/%X while outputDB still holds xid %u "
+				  "committing at %X/%X, at or below endpos %X/%X",
+				  LSN_FORMAT_ARGS(context->previousLSN),
+				  pending.xid,
+				  LSN_FORMAT_ARGS(pending.lsn),
+				  LSN_FORMAT_ARGS(endpos));
+		return false;
+	}
+
+	/* replay_lsn, from the origin, is what receive confirms to the slot */
+	uint64_t confirmLSN = Min(endpos, specs->upstream_confirm_lsn);
+	bool advanced = false;
+
+	/* before the origin: a stop in between leaves a resume to move both */
+	if (!stream_apply_advance_wal_worker_slot(specs, confirmLSN, &advanced))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	if (!advanced || stream_apply_stopping())
+	{
+		return true;
+	}
+
+	/* an empty transaction moves the origin only once it has an xid */
+	if (context->previousLSN < confirmLSN)
+	{
+		PGSQL *applyPgConn = &(context->applyPgConn);
+		char timestamp[PG_MAX_TIMESTAMP] = { 0 };
+
+		/* that commit drains the pipeline: an error shows before 'done' */
+		if (!pgsql_timestamptz_to_string(feGetCurrentTimestamp(),
+										 timestamp, sizeof(timestamp)) ||
+			!pgsql_begin(applyPgConn) ||
+			!pgsql_execute(applyPgConn, "SELECT txid_current()") ||
+			!stream_apply_commit(context, confirmLSN, timestamp))
+		{
+			log_error("Failed to move replication origin \"%s\" to %X/%X",
+					  context->origin, LSN_FORMAT_ARGS(confirmLSN));
+			return false;
+		}
+
+		context->previousLSN = confirmLSN;
+	}
+
+	CopyDBSentinel sentinel = { 0 };
+
+	if (!sentinel_sync_apply(context->sourceDB, confirmLSN, &sentinel))
+	{
+		log_error("Failed to record replay_lsn %X/%X at endpos %X/%X",
+				  LSN_FORMAT_ARGS(confirmLSN),
+				  LSN_FORMAT_ARGS(endpos));
+		return false;
+	}
+
+	log_info("Moved replication slot \"%s\" and origin \"%s\" to %X/%X "
+			 "at endpos %X/%X",
+			 specs->slot.slotName,
+			 context->origin,
+			 LSN_FORMAT_ARGS(confirmLSN),
+			 LSN_FORMAT_ARGS(endpos));
+
+	*finished = true;
+
+	return true;
 }
 
 
@@ -239,7 +537,8 @@ apply_group_limit(const char *name, int fallback)
  *
  * Three explicit guards before each transaction:
  *   Guard 1 – commitLSN <= cursor:       already applied, skip.
- *   Guard 2 – endpos < beginLSN:         endpos before this txn, stop.
+ *   Guard 2 – endpos < beginLSN:         endpos before this txn, stop;
+ *             a WAL worker stops before any txn committing past endpos.
  *   Guard 3 – beginLSN < endpos < commitLSN: endpos is mid-transaction;
  *             we still apply the full transaction and stop afterwards.
  *
@@ -480,6 +779,7 @@ stream_apply_replaydb(StreamSpecs *specs, StreamApplyContext *context)
 				 * pipeline_state["apply"].run_state = 'done'.
 				 */
 				context->reachedEndPos = true;
+				context->stopEndpos = context->endpos;
 				(void) stream_apply_sync_sentinel(context, false);
 				break;
 			}
@@ -494,6 +794,7 @@ stream_apply_replaydb(StreamSpecs *specs, StreamApplyContext *context)
 				context->endpos <= context->previousLSN)
 			{
 				context->reachedEndPos = true;
+				context->stopEndpos = context->endpos;
 				log_notice("Apply reached end position %X/%X at LSN %X/%X",
 						   LSN_FORMAT_ARGS(context->endpos),
 						   LSN_FORMAT_ARGS(context->previousLSN));
@@ -591,12 +892,15 @@ stream_apply_replaydb(StreamSpecs *specs, StreamApplyContext *context)
 			 *
 			 * In FOLLOW mode the upstream_done flag signals receive completion;
 			 * in CATCHUP mode (no pipe) consult receive's pipeline_state row.
+			 * A WAL worker consults it too: receive records done without a
+			 * signal when a signal stopped it short of endpos, or endpos moved
+			 * past its stop record in its last flush.
 			 */
 			if (context->endpos != InvalidXLogRecPtr)
 			{
 				bool receive_done = specs->upstream_done;
 
-				if (!receive_done && pipe_rd < 0)
+				if (!receive_done && (pipe_rd < 0 || specs->walWorker))
 				{
 					/* Catchup mode: consult the durable pipeline_state record */
 					PipelineStateEntry ts = { 0 };
@@ -620,6 +924,7 @@ stream_apply_replaydb(StreamSpecs *specs, StreamApplyContext *context)
 							   LSN_FORMAT_ARGS(context->previousLSN));
 
 					context->reachedEndPos = true;
+					context->stopEndpos = context->endpos;
 					(void) stream_apply_sync_sentinel(context, false);
 					break;
 				}
@@ -719,9 +1024,14 @@ stream_apply_replaydb(StreamSpecs *specs, StreamApplyContext *context)
 				}
 			}
 
-			/* Guard 2: endpos lies entirely before this transaction. */
+			/*
+			 * Guard 2: endpos lies entirely before this transaction. A WAL
+			 * worker cuts at the commit LSN, the same for every worker: each
+			 * stream has its own BEGIN position for one source transaction.
+			 */
 			if (context->endpos != InvalidXLogRecPtr &&
-				context->endpos < beginLSN)
+				(context->endpos < beginLSN ||
+				 (specs->walWorker && context->endpos < commitLSN)))
 			{
 				if (context->groupOpen &&
 					!stream_apply_group_close(context, &current))
@@ -731,6 +1041,7 @@ stream_apply_replaydb(StreamSpecs *specs, StreamApplyContext *context)
 				}
 
 				context->reachedEndPos = true;
+				context->stopEndpos = context->endpos;
 
 				log_notice("Apply reached end position %X/%X before "
 						   "xid %u beginLSN %X/%X — stopping at "
@@ -764,6 +1075,8 @@ stream_apply_replaydb(StreamSpecs *specs, StreamApplyContext *context)
 			 * Note: when beginLSN == commitLSN (single-DML autocommit) the
 			 * strict inequalities make this condition false — correct, since
 			 * there is no "inside" the transaction to straddle.
+			 *
+			 * A WAL worker never gets here: Guard 2 stopped it before.
 			 */
 			bool midTxnEndpos =
 				context->endpos != InvalidXLogRecPtr &&
@@ -854,6 +1167,7 @@ stream_apply_replaydb(StreamSpecs *specs, StreamApplyContext *context)
 				context->endpos <= context->previousLSN)
 			{
 				context->reachedEndPos = true;
+				context->stopEndpos = context->endpos;
 
 				log_notice("Apply reached end position %X/%X after "
 						   "committing xid %u at %X/%X",

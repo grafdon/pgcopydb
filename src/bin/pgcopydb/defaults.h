@@ -71,6 +71,8 @@
 #define PGCOPYDB_SKIP_CTID_SPLIT "PGCOPYDB_SKIP_CTID_SPLIT"
 #define PGCOPYDB_USE_COPY_BINARY "PGCOPYDB_USE_COPY_BINARY"
 #define PGCOPYDB_REPLAY_NO_OP_UPDATES "PGCOPYDB_REPLAY_NO_OP_UPDATES"
+#define PGCOPYDB_WAL_WORKERS "PGCOPYDB_WAL_WORKERS"
+#define PGCOPYDB_WAL_HIGH_TRAFFIC_TABLES "PGCOPYDB_WAL_HIGH_TRAFFIC_TABLES"
 
 /* default values for the command line options */
 #define DEFAULT_TABLE_JOBS 4
@@ -78,6 +80,17 @@
 #define DEFAULT_RESTORE_JOBS 0
 #define DEFAULT_LARGE_OBJECTS_JOBS 4
 #define DEFAULT_SPLIT_TABLES_LARGER_THAN 0 /* no COPY partitioning by default */
+#define DEFAULT_WAL_WORKERS 1
+#define MAX_WAL_WORKERS 16
+
+/* publication S_t<oid> fits in 63 bytes with a 10-digit oid */
+#define MAX_WAL_WORKERS_SLOT_NAME_LEN 51
+
+/* origin O_w<k> fits in 63 bytes with k up to 15 */
+#define MAX_WAL_WORKERS_ORIGIN_LEN 59
+
+/* one "schema.table" of two names and a comma per worker */
+#define WAL_HIGH_TRAFFIC_TABLES_BUFSIZE (MAX_WAL_WORKERS * 2 * NAMEDATALEN)
 
 #define POSTGRES_CONNECT_TIMEOUT "10"
 

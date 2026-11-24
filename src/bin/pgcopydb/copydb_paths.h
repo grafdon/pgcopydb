@@ -65,6 +65,9 @@ typedef struct DumpPaths
 
 	char postListOutFilename[MAXPGPATH]; /* pg_restore --list */
 	char postListFilename[MAXPGPATH];    /* pg_restore --use-list */
+
+	char fkListFilename[MAXPGPATH];  /* foreign keys only, after endpos */
+	char fkDoneFilename[MAXPGPATH];  /* foreign keys have been created */
 } DumpPaths;
 
 

@@ -158,6 +158,12 @@ jobs:
           - cdc-copy-multi-insert
           - cdc-receive-group-commit
           - cdc-endpos-before-txn
+          - cdc-wal-workers
+          - cdc-wal-workers-endpos
+          - cdc-wal-workers-fk
+          - cdc-wal-workers-resume
+          - cdc-wal-workers-idle
+          - wal-workers-assign
         exclude:
           # timescaledb uses timescale/timescaledb:latest-pg13 for both source
           # and target. pg_restore from PG17+ emits "SET transaction_timeout = 0"
@@ -181,6 +187,11 @@ jobs:
         run: |
             echo "TEST=${{ matrix.TEST }}" >> $GITHUB_ENV
             echo "PGVERSION=${{ matrix.PGVERSION }}" >> $GITHUB_ENV
+            # one WAL worker, set explicitly, must behave as the default
+            case "${{ matrix.TEST }}" in
+              follow-pgoutput|cdc-truncate-multi|cdc-interleaved-commits)
+                echo "PGCOPYDB_WAL_WORKERS=1" >> $GITHUB_ENV ;;
+            esac
 
       - name: Download pre-built Docker images
         uses: actions/download-artifact@v8

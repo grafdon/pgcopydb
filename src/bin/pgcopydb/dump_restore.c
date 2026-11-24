@@ -706,6 +706,8 @@ typedef struct RestoreListContext
 	CopyDataSpec *specs;
 	FILE *outStream;
 	bool schemasOnly;   /* write only SCHEMA entries (first pass) */
+	bool fkOnly;        /* write only foreign keys, after endpos */
+	bool prevIsFK;      /* the previous entry is an FK CONSTRAINT */
 } RestoreListContext;
 
 /*
@@ -860,6 +862,90 @@ copydb_write_schemas_restore_list(CopyDataSpec *specs)
 
 
 /*
+ * copydb_target_restore_fkeys creates the foreign keys that post-data left out
+ * for WAL workers. --clean --if-exists drops the ones an interrupted pass made
+ * before creating them again, and the done file skips the pass on a rerun.
+ */
+bool
+copydb_target_restore_fkeys(CopyDataSpec *specs)
+{
+	DumpPaths *paths = &(specs->dumpPaths);
+
+	if (file_exists(paths->fkDoneFilename))
+	{
+		log_info("Skipping foreign keys, created on a previous run");
+		return true;
+	}
+
+	if (!file_exists(paths->dumpFilename))
+	{
+		log_fatal("Failed to create the foreign keys: "
+				  "file \"%s\" does not exist",
+				  paths->dumpFilename);
+		return false;
+	}
+
+	if (!pg_restore_list(&(specs->pgPaths),
+						 paths->dumpFilename,
+						 paths->postListOutFilename))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	FILE *out = fopen_with_umask(paths->fkListFilename, "wb", FOPEN_FLAGS_W, 0644);
+
+	if (out == NULL)
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	RestoreListContext context = {
+		.specs = specs,
+		.outStream = out,
+		.fkOnly = true
+	};
+
+	if (!archive_iter_toc(paths->postListOutFilename,
+						  &context,
+						  copydb_write_restore_list_hook))
+	{
+		log_error("Failed to prepare the foreign keys pg_restore list file, "
+				  "see above for details");
+		(void) fclose(out);
+		return false;
+	}
+
+	if (fclose(out) == EOF)
+	{
+		log_error("Failed to write file \"%s\"", paths->fkListFilename);
+		return false;
+	}
+
+	RestoreOptions options = specs->restoreOptions;
+
+	options.dropIfExists = true;
+	options.section = PG_RESTORE_SECTION_POST_DATA;
+
+	log_info("Creating the foreign keys, every WAL worker reached endpos");
+
+	if (!pg_restore_db(&(specs->pgPaths),
+					   &(specs->connStrings),
+					   &(specs->filters),
+					   paths->dumpFilename,
+					   paths->fkListFilename,
+					   options))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	return write_file("", 0, paths->fkDoneFilename);
+}
+
+
+/*
  * copydb_write_restore_list_hook is an iterator callback function.
  */
 static bool
@@ -874,6 +960,12 @@ copydb_write_restore_list_hook(void *ctx, ArchiveContentItem *item)
 
 	bool skip = false;
 
+	/* pg_dump writes the COMMENT on a foreign key right after it */
+	bool isFK = item->desc == ARCHIVE_TAG_FK_CONSTRAINT ||
+				(context->prevIsFK && item->desc == ARCHIVE_TAG_COMMENT);
+
+	context->prevIsFK = item->desc == ARCHIVE_TAG_FK_CONSTRAINT;
+
 	/*
 	 * Always skip DATABASE objets as pgcopydb does not create the target
 	 * database.
@@ -882,6 +974,24 @@ copydb_write_restore_list_hook(void *ctx, ArchiveContentItem *item)
 	{
 		skip = true;
 		log_debug("Skipping DATABASE \"%s\"", name);
+	}
+
+	if (!skip && context->fkOnly && !isFK)
+	{
+		skip = true;
+	}
+
+	/* the WAL worker of a referenced table truncates it alone */
+	if (!skip && isFK && !context->fkOnly &&
+		specs->follow && specs->walWorkers > 1)
+	{
+		skip = true;
+
+		log_debug("Skipping foreign key dumpId %d until every WAL worker "
+				  "reached endpos: %s %s",
+				  item->dumpId,
+				  item->description,
+				  name);
 	}
 
 	/*

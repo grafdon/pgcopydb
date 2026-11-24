@@ -33,6 +33,18 @@
  * pgcopydb catalog cache is a SQLite database with the following schema:
  */
 
+/* also run by catalog_upgrade_schema, so older work dirs get the tables */
+#define WAL_WORKER_SETUP_DDL \
+	"create table if not exists wal_worker_setup(" \
+	"  id integer primary key check (id = 1), " \
+	"  workers integer not null, high_traffic text not null)"
+
+#define WAL_WORKER_TABLE_DDL \
+	"create table if not exists wal_worker_table(" \
+	"  oid integer primary key, nspname text not null, relname text not null, " \
+	"  family integer not null, weight integer not null, " \
+	"  bytes integer not null, worker integer not null)"
+
 /*
  * pgcopydb catalog cache is a SQLite database with the following schema.
  *
@@ -280,6 +292,9 @@ static char *sourceDBcreateTableDDLs[] = {
 	"  relname text, "
 	"  relname_re text"
 	")",
+
+	WAL_WORKER_SETUP_DDL,
+	WAL_WORKER_TABLE_DDL,
 
 	/* All indexes other than s_i_tableoid / s_c_indexoid stay here so they are
 	 * created on empty tables and enforce uniqueness during data load. */
@@ -1648,8 +1663,8 @@ catalog_init(DatabaseCatalog *catalog)
 
 
 /*
- * catalog_upgrade_schema adds the columns that a catalog written by an older
- * pgcopydb lacks, so that --resume works across a pgcopydb upgrade.
+ * catalog_upgrade_schema adds the columns and tables that a catalog written by
+ * an older pgcopydb lacks, so that --resume works across a pgcopydb upgrade.
  */
 static bool
 catalog_upgrade_schema(DatabaseCatalog *catalog)
@@ -1754,6 +1769,15 @@ catalog_upgrade_schema(DatabaseCatalog *catalog)
 			(void) semaphore_unlock(&(catalog->sema));
 			return false;
 		}
+	}
+
+	if (catalog->type == DATABASE_CATALOG_TYPE_SOURCE &&
+		(!catalog_execute(catalog, WAL_WORKER_SETUP_DDL) ||
+		 !catalog_execute(catalog, WAL_WORKER_TABLE_DDL)))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
 	}
 
 	(void) semaphore_unlock(&(catalog->sema));
@@ -3102,6 +3126,507 @@ catalog_open_for_slot(const char *dbfile, DatabaseCatalog *catalog)
 	}
 
 	return true;
+}
+
+
+/*
+ * catalog_write_wal_workers replaces the stored WAL worker assignment in one
+ * transaction, so that a crash never leaves half of one behind.
+ */
+bool
+catalog_write_wal_workers(DatabaseCatalog *catalog,
+						  int workers,
+						  const char *highTraffic,
+						  WalWorkerTable *tables,
+						  int count)
+{
+	sqlite3 *db = catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: catalog_write_wal_workers: db is NULL");
+		return false;
+	}
+
+	/* catalog_sql_bind turns an empty list into null */
+	char *setupSQL =
+		"insert into wal_worker_setup(id, workers, high_traffic) "
+		"values(1, $1, coalesce($2, ''))";
+
+	char *tableSQL =
+		"insert into wal_worker_table"
+		"(oid, nspname, relname, family, weight, bytes, worker) "
+		"values($1, $2, $3, $4, $5, $6, $7)";
+
+	if (!semaphore_lock(&(catalog->sema)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	if (!catalog_begin(catalog, true))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	SQLiteQuery query = { 0 };
+	BindParam setupParams[] = {
+		{ BIND_PARAMETER_TYPE_INT64, "workers", workers, NULL },
+		{ BIND_PARAMETER_TYPE_TEXT, "high_traffic", 0, (char *) highTraffic }
+	};
+
+	bool success =
+		catalog_execute(catalog, "delete from wal_worker_table") &&
+		catalog_execute(catalog, "delete from wal_worker_setup") &&
+		catalog_sql_prepare_cached(catalog, setupSQL, &query) &&
+		catalog_sql_bind(&query, setupParams, 2) &&
+		catalog_sql_execute_once(&query);
+
+	for (int i = 0; success && i < count; i++)
+	{
+		WalWorkerTable *table = &(tables[i]);
+		BindParam params[] = {
+			{ BIND_PARAMETER_TYPE_INT64, "oid", table->oid, NULL },
+			{ BIND_PARAMETER_TYPE_TEXT, "nspname", 0, table->nspname },
+			{ BIND_PARAMETER_TYPE_TEXT, "relname", 0, table->relname },
+			{ BIND_PARAMETER_TYPE_INT64, "family", table->family, NULL },
+			{ BIND_PARAMETER_TYPE_INT64, "weight", table->weight, NULL },
+			{ BIND_PARAMETER_TYPE_INT64, "bytes", table->bytes, NULL },
+			{ BIND_PARAMETER_TYPE_INT64, "worker", table->worker, NULL }
+		};
+
+		SQLiteQuery rowQuery = { 0 };
+
+		success =
+			catalog_sql_prepare_cached(catalog, tableSQL, &rowQuery) &&
+			catalog_sql_bind(&rowQuery, params, 7) &&
+			catalog_sql_execute_once(&rowQuery);
+	}
+
+	if (!success)
+	{
+		log_error("Failed to store the WAL worker assignment in \"%s\"",
+				  catalog->dbfile);
+		(void) catalog_rollback(catalog);
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	if (!catalog_commit(catalog))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	(void) semaphore_unlock(&(catalog->sema));
+
+	return true;
+}
+
+
+typedef struct WalWorkerSetupContext
+{
+	int *workers;
+	char *highTraffic;
+	size_t size;
+	bool *found;
+} WalWorkerSetupContext;
+
+
+static bool
+catalog_wal_worker_setup_fetch(SQLiteQuery *query)
+{
+	WalWorkerSetupContext *context = (WalWorkerSetupContext *) query->context;
+	const char *highTraffic = (const char *) sqlite3_column_text(query->ppStmt, 1);
+
+	if (strlcpy(context->highTraffic, highTraffic, context->size) >= context->size)
+	{
+		log_error("Failed to read the WAL high-traffic tables \"%s\": "
+				  "%zu bytes do not fit in %zu",
+				  highTraffic, strlen(highTraffic), context->size);
+		context->highTraffic[0] = '\0';
+		return false;
+	}
+
+	*(context->workers) = sqlite3_column_int(query->ppStmt, 0);
+	*(context->found) = true;
+
+	return true;
+}
+
+
+/*
+ * catalog_read_wal_worker_setup reads the stored worker count and list, with
+ * found false when no assignment was ever stored.
+ */
+bool
+catalog_read_wal_worker_setup(DatabaseCatalog *catalog,
+							  int *workers,
+							  char *highTraffic,
+							  size_t size,
+							  bool *found)
+{
+	sqlite3 *db = catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: catalog_read_wal_worker_setup: db is NULL");
+		return false;
+	}
+
+	char *sql =
+		"select workers, high_traffic from wal_worker_setup where id = 1";
+
+	WalWorkerSetupContext context = {
+		.workers = workers,
+		.highTraffic = highTraffic,
+		.size = size,
+		.found = found
+	};
+
+	SQLiteQuery query = {
+		.errorOnZeroRows = false,
+		.context = &context,
+		.fetchFunction = &catalog_wal_worker_setup_fetch
+	};
+
+	*found = false;
+
+	if (!semaphore_lock(&(catalog->sema)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	if (!catalog_sql_prepare(db, sql, &query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	if (!catalog_sql_execute_once(&query))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(catalog->sema));
+		return false;
+	}
+
+	(void) semaphore_unlock(&(catalog->sema));
+
+	return true;
+}
+
+
+/*
+ * catalog_iter_wal_worker_table calls the callback for each stored table
+ * assignment, by oid.
+ */
+bool
+catalog_iter_wal_worker_table(DatabaseCatalog *catalog,
+							  void *context,
+							  WalWorkerTableIterFun *callback)
+{
+	sqlite3 *db = catalog->db;
+
+	if (db == NULL)
+	{
+		log_error("BUG: catalog_iter_wal_worker_table: db is NULL");
+		return false;
+	}
+
+	char *sql =
+		"  select oid, nspname, relname, family, weight, bytes, worker "
+		"    from wal_worker_table "
+		"order by oid";
+
+	SQLiteQuery query = { 0 };
+
+	if (!catalog_sql_prepare(db, sql, &query))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	int rc;
+
+	while ((rc = catalog_sql_step(&query)) == SQLITE_ROW)
+	{
+		sqlite3_stmt *stmt = query.ppStmt;
+		WalWorkerTable table = {
+			.oid = (uint32_t) sqlite3_column_int64(stmt, 0),
+			.family = (uint32_t) sqlite3_column_int64(stmt, 3),
+			.weight = sqlite3_column_int64(stmt, 4),
+			.bytes = sqlite3_column_int64(stmt, 5),
+			.worker = sqlite3_column_int(stmt, 6)
+		};
+
+		strlcpy(table.nspname,
+				(char *) sqlite3_column_text(stmt, 1),
+				sizeof(table.nspname));
+		strlcpy(table.relname,
+				(char *) sqlite3_column_text(stmt, 2),
+				sizeof(table.relname));
+
+		if (!(*callback)(context, &table))
+		{
+			log_error("Failed to iterate over the WAL worker tables, "
+					  "see above for details");
+			(void) catalog_sql_finalize(&query);
+			return false;
+		}
+	}
+
+	if (rc != SQLITE_DONE)
+	{
+		log_error("Failed to step through statement: %s", sql);
+		log_error("[SQLite] %s", sqlite3_errmsg(db));
+		(void) catalog_sql_finalize(&query);
+		return false;
+	}
+
+	return catalog_sql_finalize(&query);
+}
+
+
+typedef struct WalWorkerPublicationsContext
+{
+	const char *slotName;
+	int worker;
+	char *buf;
+	size_t size;
+	size_t len;
+} WalWorkerPublicationsContext;
+
+
+static bool
+catalog_wal_worker_publications_add(void *ctx, WalWorkerTable *table)
+{
+	WalWorkerPublicationsContext *context = (WalWorkerPublicationsContext *) ctx;
+
+	if (table->worker != context->worker)
+	{
+		return true;
+	}
+
+	char name[BUFSIZE] = { 0 };
+
+	sformat(name, sizeof(name), "%s%s_t%u",
+			context->len == 0 ? "" : ",",
+			context->slotName,
+			table->oid);
+
+	size_t len = strlen(name);
+
+	if (context->len + len >= context->size)
+	{
+		log_error("Failed to list the publications of WAL worker %d: "
+				  "they do not fit in %zu bytes",
+				  context->worker, context->size);
+		return false;
+	}
+
+	strlcpy(context->buf + context->len, name, context->size - context->len);
+	context->len += len;
+
+	return true;
+}
+
+
+/*
+ * catalog_wal_worker_publications lists the publication names of a worker's
+ * tables, comma-separated and by oid. A worker without a table is an error.
+ */
+bool
+catalog_wal_worker_publications(DatabaseCatalog *catalog,
+								const char *slotName,
+								int worker,
+								char *buf,
+								size_t size)
+{
+	WalWorkerPublicationsContext context = {
+		.slotName = slotName,
+		.worker = worker,
+		.buf = buf,
+		.size = size,
+		.len = 0
+	};
+
+	if (size == 0)
+	{
+		log_error("BUG: catalog_wal_worker_publications: buffer has 0 bytes");
+		return false;
+	}
+
+	buf[0] = '\0';
+
+	if (!catalog_iter_wal_worker_table(catalog,
+									   &context,
+									   &catalog_wal_worker_publications_add))
+	{
+		/* errors have already been logged */
+		buf[0] = '\0';
+		return false;
+	}
+
+	if (context.len == 0)
+	{
+		log_error("Failed to list the publications of WAL worker %d: "
+				  "catalog \"%s\" assigns it no table",
+				  worker, catalog->dbfile);
+		return false;
+	}
+
+	return true;
+}
+
+
+/*
+ * catalog_copy_wal_worker_rows runs one INSERT ... SELECT from the attached
+ * main catalog, and fails unless it copied exactly the expected row count.
+ */
+static bool
+catalog_copy_wal_worker_rows(DatabaseCatalog *worker, char *sql,
+							 BindParam *params, int count, int expected)
+{
+	SQLiteQuery query = { 0 };
+
+	if (!catalog_sql_prepare(worker->db, sql, &query) ||
+		(count > 0 && !catalog_sql_bind(&query, params, count)) ||
+		!catalog_sql_execute_once(&query))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	if (expected >= 0 && sqlite3_changes(worker->db) != expected)
+	{
+		log_error("Failed to copy %d row(s) to \"%s\", copied %d: %s",
+				  expected, worker->dbfile, sqlite3_changes(worker->db), sql);
+		return false;
+	}
+
+	return true;
+}
+
+
+/*
+ * catalog_copy_wal_worker_catalog fills the empty catalog of a WAL worker
+ * from the main catalog in one transaction, sentinel last: a worker catalog
+ * is complete once sentinel_get succeeds on it.
+ */
+bool
+catalog_copy_wal_worker_catalog(DatabaseCatalog *worker,
+								DatabaseCatalog *source,
+								const char *cdcDir,
+								const char *workerDir,
+								const ReplicationSlot *slot)
+{
+	char *tablesSQL[] = {
+		"insert into main.s_table"
+		"  (oid, datname, qname, nspname, relname, amname, restore_list_name,"
+		"   relpages, reltuples, exclude_data, part_key) "
+		"select oid, datname, qname, nspname, relname, amname, restore_list_name,"
+		"       relpages, reltuples, exclude_data, part_key "
+		"  from parent.s_table",
+
+		"insert into main.s_attr"
+		"  (oid, attnum, attypid, attname, attisprimary, attisreplident,"
+		"   attisgenerated, attidentity, attisbinarycompatible, atttypsend) "
+		"select oid, attnum, attypid, attname, attisprimary, attisreplident,"
+		"       attisgenerated, attidentity, attisbinarycompatible, atttypsend "
+		"  from parent.s_attr",
+
+		"insert into main.s_table_size(oid, bytes, bytes_pretty) "
+		"select oid, bytes, bytes_pretty from parent.s_table_size",
+
+		"insert into main.s_table_part"
+		"  (oid, partnum, partcount, min, max, count) "
+		"select oid, partnum, partcount, min, max, count "
+		"  from parent.s_table_part",
+
+		"insert into main.timeline_history(tli, startpos, endpos) "
+		"select tli, startpos, endpos from parent.timeline_history",
+
+		"insert into main.wal_worker_table"
+		"  (oid, nspname, relname, family, weight, bytes, worker) "
+		"select oid, nspname, relname, family, weight, bytes, worker "
+		"  from parent.wal_worker_table"
+	};
+
+	/* the first output.db of the main dir, moved to the worker dir */
+	char *cdcFilesSQL =
+		"insert into main.cdc_files"
+		"  (filename, timeline, startpos, start_time_epoch) "
+		"select $1 || substr(filename, length($2) + 1),"
+		"       timeline, startpos, start_time_epoch "
+		"  from parent.cdc_files "
+		" where substr(filename, 1, length($2) + 1) = $2 || '/' "
+		"order by id "
+		"   limit 1";
+
+	char *sentinelSQL =
+		"insert into main.sentinel"
+		"  (id, startpos, endpos, apply, write_lsn, flush_lsn, replay_lsn) "
+		"select id, startpos, endpos, apply, write_lsn, flush_lsn, replay_lsn "
+		"  from parent.sentinel";
+
+	BindParam dirParams[] = {
+		{ BIND_PARAMETER_TYPE_TEXT, "worker_dir", 0, (char *) workerDir },
+		{ BIND_PARAMETER_TYPE_TEXT, "cdc_dir", 0, (char *) cdcDir }
+	};
+
+	if (!semaphore_lock(&(worker->sema)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	if (!catalog_attach(worker, source, "parent"))
+	{
+		/* errors have already been logged */
+		(void) semaphore_unlock(&(worker->sema));
+		return false;
+	}
+
+	bool success = catalog_begin(worker, true);
+
+	if (success)
+	{
+		int count = sizeof(tablesSQL) / sizeof(tablesSQL[0]);
+
+		for (int i = 0; success && i < count; i++)
+		{
+			success =
+				catalog_copy_wal_worker_rows(worker, tablesSQL[i], NULL, 0, -1);
+		}
+
+		success = success &&
+				  catalog_copy_wal_worker_rows(worker, cdcFilesSQL,
+											   dirParams, 2, 1) &&
+				  catalog_write_replication_slot(worker, slot) &&
+				  catalog_copy_wal_worker_rows(worker, sentinelSQL, NULL, 0, 1);
+
+		if (success)
+		{
+			success = catalog_commit(worker);
+		}
+		else
+		{
+			log_error("Failed to copy catalog \"%s\" to \"%s\"",
+					  source->dbfile, worker->dbfile);
+			(void) catalog_rollback(worker);
+		}
+	}
+
+	success = catalog_execute(worker, "detach parent") && success;
+
+	(void) semaphore_unlock(&(worker->sema));
+
+	return success;
 }
 
 

@@ -379,6 +379,226 @@ copydb_should_export_snapshot(CopyDataSpec *copySpecs)
 
 
 /*
+ * copydb_wal_workers_source connects to the source, which needs Postgres 13:
+ * Postgres 12 cannot add a partitioned table to a publication.
+ */
+static bool
+copydb_wal_workers_source(CopyDataSpec *copySpecs, PGSQL *src)
+{
+	if (!pgsql_init(src, copySpecs->connStrings.source_pguri, PGSQL_CONN_SOURCE) ||
+		!pgsql_server_version(src))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	if (src->pgversion_num < 130000)
+	{
+		log_fatal("Option --wal-workers %d requires Postgres 13 or later "
+				  "on the source, found Postgres %s",
+				  copySpecs->walWorkers, src->pgversion);
+		return false;
+	}
+
+	return true;
+}
+
+
+/*
+ * copydb_check_reused_wal_workers refuses a re-used slot set up for other WAL
+ * workers, and checks every worker slot without creating or copying one.
+ */
+static bool
+copydb_check_reused_wal_workers(CopyDataSpec *copySpecs, ReplicationSlot *slot)
+{
+	int walWorkers = copySpecs->walWorkers > 1 ? copySpecs->walWorkers : 1;
+	int workers = 1;
+	char highTraffic[WAL_HIGH_TRAFFIC_TABLES_BUFSIZE] = { 0 };
+	bool found = false;
+
+	if (!catalog_read_wal_worker_setup(&(copySpecs->catalogs.source),
+									   &workers,
+									   highTraffic,
+									   sizeof(highTraffic),
+									   &found))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	if (workers != walWorkers ||
+		!streq(highTraffic, copySpecs->walHighTrafficTables))
+	{
+		log_fatal("Failed to re-use replication slot \"%s\": it was set up "
+				  "with --wal-workers %d --wal-high-traffic-tables \"%s\", "
+				  "this run uses --wal-workers %d "
+				  "--wal-high-traffic-tables \"%s\"",
+				  slot->slotName,
+				  workers,
+				  highTraffic,
+				  walWorkers,
+				  copySpecs->walHighTrafficTables);
+		log_info("Use --restart to drop the replication setup and start over");
+		return false;
+	}
+
+	if (walWorkers == 1)
+	{
+		return true;
+	}
+
+	PGSQL src = { 0 };
+
+	if (!copydb_wal_workers_source(copySpecs, &src))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	for (int k = 0; k < walWorkers; k++)
+	{
+		char workerSlot[NAMEDATALEN] = { 0 };
+
+		sformat(workerSlot, sizeof(workerSlot), "%s_w%d", slot->slotName, k);
+
+		const char *name = k == 0 ? slot->slotName : workerSlot;
+
+		if (!pgsql_check_wal_worker_slot(&src, name, slot->lsn))
+		{
+			log_fatal("Failed to re-use replication slot \"%s\" of WAL worker "
+					  "%d created at %X/%X, see above for details",
+					  name, k, LSN_FORMAT_ARGS(slot->lsn));
+			return false;
+		}
+	}
+
+	return true;
+}
+
+
+/*
+ * copydb_check_no_wal_workers refuses a fresh setup over the assignment of an
+ * earlier attempt that never recorded its slot: replacing it would hide the
+ * worker slots of that attempt from stream cleanup.
+ */
+static bool
+copydb_check_no_wal_workers(CopyDataSpec *copySpecs, ReplicationSlot *slot)
+{
+	int workers = 0;
+	char highTraffic[WAL_HIGH_TRAFFIC_TABLES_BUFSIZE] = { 0 };
+	bool found = false;
+
+	if (!catalog_read_wal_worker_setup(&(copySpecs->catalogs.source),
+									   &workers,
+									   highTraffic,
+									   sizeof(highTraffic),
+									   &found))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	if (found)
+	{
+		log_fatal("Failed to create replication slot \"%s\": an earlier "
+				  "attempt set up --wal-workers %d in catalog \"%s\" and "
+				  "stopped before it recorded the slot",
+				  slot->slotName,
+				  workers,
+				  copySpecs->catalogs.source.dbfile);
+		log_info("Run pgcopydb stream cleanup with the same --dir, "
+				 "--slot-name and --origin as that attempt, then start over "
+				 "with --restart");
+		return false;
+	}
+
+	return true;
+}
+
+
+/*
+ * copydb_prepare_wal_workers assigns the tables to publish to WAL workers,
+ * stores the assignment, then creates one publication per table.
+ */
+static bool
+copydb_prepare_wal_workers(CopyDataSpec *copySpecs, ReplicationSlot *slot)
+{
+	PGSQL src = { 0 };
+	WalWorkerTable *tables = NULL;
+	int count = 0;
+
+	if (!copydb_wal_workers_source(copySpecs, &src) ||
+		!pgsql_list_publication_tables(&src, &(copySpecs->filters),
+									   &tables, &count))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	bool success =
+		wal_workers_assign(tables, count,
+						   copySpecs->walWorkers,
+						   copySpecs->walHighTrafficTables) &&
+		catalog_write_wal_workers(&(copySpecs->catalogs.source),
+								  copySpecs->walWorkers,
+								  copySpecs->walHighTrafficTables,
+								  tables, count) &&
+		pgsql_create_table_publications(&src, slot->slotName, tables, count);
+
+	free(tables);
+
+	return success;
+}
+
+
+/*
+ * copydb_copy_wal_worker_slots copies slot S to S_w<k>, so that every worker
+ * starts at the consistent point of the snapshot the base copy uses.
+ */
+static bool
+copydb_copy_wal_worker_slots(CopyDataSpec *copySpecs, ReplicationSlot *slot)
+{
+	PGSQL src = { 0 };
+
+	if (!pgsql_init(&src, copySpecs->connStrings.source_pguri, PGSQL_CONN_SOURCE))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	for (int k = 1; k < copySpecs->walWorkers; k++)
+	{
+		char workerSlot[NAMEDATALEN] = { 0 };
+		uint64_t lsn = InvalidXLogRecPtr;
+
+		sformat(workerSlot, sizeof(workerSlot), "%s_w%d", slot->slotName, k);
+
+		if (!pgsql_copy_logical_replication_slot(&src, slot->slotName,
+												 workerSlot, &lsn))
+		{
+			log_fatal("Failed to create the replication slot of WAL worker %d, "
+					  "see above for details",
+					  k);
+			return false;
+		}
+
+		if (lsn != slot->lsn)
+		{
+			log_fatal("Replication slot \"%s\" was copied at %X/%X, "
+					  "expected %X/%X as in replication slot \"%s\"",
+					  workerSlot,
+					  LSN_FORMAT_ARGS(lsn),
+					  LSN_FORMAT_ARGS(slot->lsn),
+					  slot->slotName);
+			return false;
+		}
+	}
+
+	return true;
+}
+
+
+/*
  * copydb_create_logical_replication_slot uses Postgres logical replication
  * protocol command CREATE_REPLICATION_SLOT to create a replication slot on the
  * source database, and exports a snapshot while doing so.
@@ -405,6 +625,12 @@ copydb_create_logical_replication_slot(CopyDataSpec *copySpecs,
 	if (slot->lsn != InvalidXLogRecPtr &&
 		!IS_EMPTY_STRING_BUFFER(slot->snapshot))
 	{
+		if (!copydb_check_reused_wal_workers(copySpecs, slot))
+		{
+			/* errors have already been logged */
+			return false;
+		}
+
 		log_info("Re-using replication slot \"%s\" "
 				 "created at %X/%X with snapshot \"%s\"",
 				 slot->slotName,
@@ -418,6 +644,12 @@ copydb_create_logical_replication_slot(CopyDataSpec *copySpecs,
 				  "the replication protocol command CREATE_REPLICATION_SLOT",
 				  sourceSnapshot->snapshot);
 		log_info("Consider using pgcopydb snapshot --follow");
+		return false;
+	}
+
+	if (!copydb_check_no_wal_workers(copySpecs, slot))
+	{
+		/* errors have already been logged */
 		return false;
 	}
 
@@ -439,7 +671,17 @@ copydb_create_logical_replication_slot(CopyDataSpec *copySpecs,
 	}
 
 	/* for pgoutput, create publication before the slot */
-	if (slot->plugin == STREAM_PLUGIN_PGOUTPUT && slot->publicationAutoManaged)
+	if (copySpecs->walWorkers > 1)
+	{
+		if (!copydb_prepare_wal_workers(copySpecs, slot))
+		{
+			log_fatal("Failed to set up %d WAL workers, see above for details",
+					  copySpecs->walWorkers);
+			return false;
+		}
+	}
+	else if (slot->plugin == STREAM_PLUGIN_PGOUTPUT &&
+			 slot->publicationAutoManaged)
 	{
 		PGSQL src = { 0 };
 
@@ -468,6 +710,13 @@ copydb_create_logical_replication_slot(CopyDataSpec *copySpecs,
 	{
 		log_error("Failed to create a logical replication slot "
 				  "and export a snapshot, see above for details");
+		return false;
+	}
+
+	if (copySpecs->walWorkers > 1 &&
+		!copydb_copy_wal_worker_slots(copySpecs, slot))
+	{
+		/* errors have already been logged */
 		return false;
 	}
 

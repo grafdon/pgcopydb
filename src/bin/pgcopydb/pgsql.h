@@ -568,6 +568,43 @@ bool pgsql_create_publication(PGSQL *pgsql, const char *pubName,
 							  struct SourceFilters *filters);
 bool pgsql_drop_publication(PGSQL *pgsql, const char *pubName);
 
+/* Forward declaration; full definition in catalog.h */
+struct WalWorkerTable;
+
+bool pgsql_list_publication_tables(PGSQL *pgsql,
+								   struct SourceFilters *filters,
+								   struct WalWorkerTable **tables,
+								   int *count);
+bool pgsql_create_table_publications(PGSQL *pgsql,
+									 const char *slotName,
+									 struct WalWorkerTable *tables,
+									 int count);
+bool pgsql_copy_logical_replication_slot(PGSQL *pgsql,
+										 const char *srcName,
+										 const char *dstName,
+										 uint64_t *lsn);
+bool pgsql_check_wal_worker_slot(PGSQL *pgsql,
+								 const char *slotName,
+								 uint64_t lsn);
+bool pgsql_replication_slot_inactive_lsn(PGSQL *pgsql,
+										 const char *slotName,
+										 uint64_t *lsn);
+bool pgsql_replication_slot_advance(PGSQL *pgsql,
+									const char *slotName,
+									uint64_t lsn,
+									uint64_t *endLSN);
+bool pgsql_wal_worker_publications_mismatch(PGSQL *pgsql,
+											const char *slotName,
+											const char *oids,
+											const char *others,
+											char *mismatch,
+											size_t size);
+bool pgsql_drop_wal_worker_slots(PGSQL *pgsql, const char *slotName);
+bool pgsql_drop_wal_worker_origins(PGSQL *pgsql, const char *origin);
+bool pgsql_drop_wal_worker_publications(PGSQL *pgsql,
+										const char *slotName,
+										const char *names);
+
 bool pgsql_role_exists(PGSQL *pgsql, const char *roleName, bool *exists);
 
 bool pgsql_configuration_exists(PGSQL *pgsql, const char *setconfig, bool *exists);

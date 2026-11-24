@@ -194,6 +194,32 @@ Otherwise run ``pgcopydb stream cleanup`` with the same ``--dir``, ``--slot-name
 A retry that creates a new replication slot copies under that slot's
 snapshot, even with ``--not-consistent``.
 
+Resuming with WAL workers
+^^^^^^^^^^^^^^^^^^^^^^^^^
+
+With ``--wal-workers`` above 1, the catalog stores the worker count, the ``--wal-high-traffic-tables`` list and the worker of every table, and a resume must use the same two options.
+Each worker keeps its own catalog and CDC files in ``cdc/w<k>`` of the work directory, and resumes from its own replication origin, so a worker killed right after a COMMIT on the target does not apply that transaction again.
+A resume never creates or copies a worker slot.
+It refuses to run when a worker slot is missing, uses another plugin than pgoutput, is invalidated, or has a confirmed flush LSN below the LSN the catalog recorded when the slots were created.
+When ``cdc/w<k>`` is lost, the resume builds it again from the main catalog only while the slot of that worker is still where it was created, because the lost files held changes that a moved slot does not send again.
+
+The setup creates the slot of worker 0 with the exported snapshot, then copies it once per other worker, and records the slot in the catalog only after the last copy.
+A setup that stops before that, killed or failed on a copy, for instance with too few ``max_replication_slots``, leaves its worker assignment in the catalog and no slot.
+A rerun refuses to set up WAL workers over that assignment, whatever ``--wal-workers`` it uses.
+Run ``pgcopydb stream cleanup`` with the same ``--dir``, ``--slot-name`` and ``--origin``, which drops every worker slot and publication of that setup, then start over with ``--restart``.
+A ``pgcopydb follow``, or a ``pgcopydb clone --follow`` whose copy finished, that stops after the setup recorded the slots, for instance before it created the replication origins, resumes with ``--resume``.
+A ``pgcopydb clone --follow`` that stops there before its copy finished has lost the exported snapshot, so its resume is refused with ``Refusing to resume the copy:``.
+Run ``pgcopydb stream cleanup`` and start over with ``--restart``.
+
+Foreign keys with WAL workers
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+With ``--wal-workers`` above 1, the foreign keys are created only once every WAL worker reached endpos.
+A command that stops before that exits with an error and logs ``Foreign keys are pending``.
+Run it again with ``--resume``, and it creates the foreign keys once every worker reached endpos.
+The file ``schema/fkeys.done`` in the work directory records that they exist, so a rerun skips them.
+A command that stops while it creates them leaves no such file, and the next run drops the foreign keys it finds before it creates them all again.
+
 Snapshot and catalogs (cache invalidation)
 ------------------------------------------
 

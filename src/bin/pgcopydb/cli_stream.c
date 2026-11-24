@@ -738,12 +738,16 @@ cli_stream_cleanup(int argc, char **argv)
 			sizeof(copySpecs.catalogs.source.dbfile));
 
 	/*
-	 * Open the source catalog so that stream_cleanup_databases can read the
-	 * replication slot metadata (e.g. publication name / auto-managed flag).
-	 * The catalog may not exist if a previous run failed early; ignore the
-	 * open failure — cleanup proceeds on a best-effort basis.
+	 * A missing catalog means a run failed early. One that exists must open,
+	 * or cleanup would drop WAL worker objects by name pattern.
 	 */
-	(void) catalog_open(&(copySpecs.catalogs.source));
+	if (file_exists(copySpecs.catalogs.source.dbfile) &&
+		!catalog_open(&(copySpecs.catalogs.source)))
+	{
+		log_fatal("Failed to open catalog \"%s\", nothing was cleaned up",
+				  copySpecs.catalogs.source.dbfile);
+		exit(EXIT_CODE_INTERNAL_ERROR);
+	}
 
 	if (!stream_cleanup_databases(&copySpecs,
 								  streamDBoptions.slot.slotName,

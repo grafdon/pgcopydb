@@ -17,4 +17,6 @@
      --create-slot                 Create the replication slot
      --origin                      Use this Postgres replication origin node name
      --endpos                      Stop replaying changes when reaching this LSN
+     --wal-workers                 Number of processes replaying changes, 1 to 16
+     --wal-high-traffic-tables     Tables that get a WAL worker of their own
    

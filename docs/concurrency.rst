@@ -129,6 +129,24 @@ Here is a description of the process tree:
    small lifecycle pipe (modelled on PostgreSQL's postmaster death-watch); see
    :ref:`pipe_protocol` for the design.
 
+   With ``--wal-workers`` above 1, the follow sub-process supervises one sub-process per WAL worker instead, and each WAL worker runs its own ``receive`` and ``apply`` processes::
+
+     + pgcopydb follow supervisor [ --wal-workers 3 ]
+       + pgcopydb follow worker 0
+         - pgcopydb stream receive
+         - pgcopydb stream apply
+       + pgcopydb follow worker 1
+         - pgcopydb stream receive
+         - pgcopydb stream apply
+       + pgcopydb follow worker 2
+         - pgcopydb stream receive
+         - pgcopydb stream apply
+
+   The follow part then counts 1 + 3 × N processes for N WAL workers, instead of 3.
+   The supervisor copies endpos and apply from the sentinel of the work directory to the sentinel of each worker, writes the lowest write, flush and replay LSN of the workers back, and runs the follow coordinator.
+   When a worker fails, the supervisor stops the other workers with SIGQUIT, because a worker does not pass a SIGTERM on to its ``receive`` and ``apply`` processes.
+   A worker stops when its supervisor exits, and on Linux the ``receive`` and ``apply`` processes of a worker stop when that worker exits.
+
 .. _index_concurrency:
 
 For each table, build all indexes concurrently

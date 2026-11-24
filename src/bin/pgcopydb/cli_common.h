@@ -89,6 +89,9 @@ typedef struct CopyDBOptions
 	bool follow;
 	bool createSlot;
 
+	int walWorkers;
+	char walHighTrafficTables[WAL_HIGH_TRAFFIC_TABLES_BUFSIZE];
+
 	/* pgcopydb stream sentinel get --flush-lsn and friends */
 	SentinelOptions sentinelOptions;
 
@@ -135,6 +138,7 @@ bool cli_copydb_getenv(CopyDBOptions *options);
 void cli_read_coordinator_env(CopyDBOptions *options);
 bool cli_copydb_is_consistent(CopyDBOptions *options);
 bool cli_read_previous_options(CopyDBOptions *options, CopyFilePaths *cfPaths);
+bool cli_validate_wal_workers(CopyDBOptions *options);
 
 bool cli_read_one_line(const char *filename,
 					   const char *name,

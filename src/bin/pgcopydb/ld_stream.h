@@ -469,6 +469,7 @@ typedef struct StreamContext
 
 	bool transactionInProgress;
 	uint32_t changeSeq;         /* seq of the last change since BEGIN */
+	uint64_t beginFinalLSN;     /* where the COMMIT record of that BEGIN starts */
 
 	/*
 	 * Output plugin identity, copied from specs->slot.plugin at context init.
@@ -497,6 +498,12 @@ typedef struct StreamContext
 	 * send the lifecycle pipe signal when endpos is reached.
 	 */
 	struct StreamSpecs *specs;
+
+	/* an error that a reconnect cannot fix, such as a WAL worker guard */
+	bool fatal;
+
+	/* the LSN a WAL worker's receive signalled done at, none after a signal */
+	uint64_t doneLSN;
 
 	/*
 	 * Set by ld_store_iter_output when the pending_xid path detects that
@@ -619,6 +626,7 @@ typedef struct StreamApplyContext
 	bool reachedStartPos;
 	bool continuedTxn;
 	bool reachedEndPos;
+	uint64_t stopEndpos;        /* the endpos the loop stopped at */
 	bool endPosRecordSeen;      /* saw a record at or past endpos */
 	bool reachedEOF;
 	bool transactionInProgress;
@@ -715,12 +723,14 @@ struct StreamSpecs
 	/*
 	 * Out-of-band lifecycle signal: upstream process writes its final LSN as
 	 * an 8-byte big-endian value to the pipe and then closes the write end.
+	 * A WAL worker writes a second one, the LSN its slot may be confirmed at.
 	 * Downstream reads it once; EOF (n==0) means upstream crashed.
 	 *
 	 * upstream_done_lsn == InvalidXLogRecPtr means "not yet received".
 	 * upstream_done     == true once the signal has been read.
 	 */
 	uint64_t upstream_done_lsn;   /* final LSN signalled by upstream */
+	uint64_t upstream_confirm_lsn;  /* a WAL worker's slot moves no further */
 	bool upstream_done;           /* have we received the upstream signal? */
 
 	/*
@@ -731,6 +741,11 @@ struct StreamSpecs
 	 */
 	char coordHost[256];
 	int coordPort;
+
+	int walWorkers;
+	bool walWorker;             /* this process is one of walWorkers */
+	int walWorkerIndex;         /* which WAL worker, with walWorker */
+	pid_t walSupervisor;        /* a worker quits once this pid is gone */
 
 	/*
 	 * User-specified source filters.  For pgoutput the publication is created
@@ -771,7 +786,8 @@ char * LogicalStreamModeToString(LogicalStreamMode mode);
 bool stream_check_in_out(StreamSpecs *specs);
 
 /* Lifecycle pipe signals (out-of-band, 8-byte big-endian LSN) */
-bool stream_signal_upstream_done(int pipe_write_fd, uint64_t done_lsn);
+bool stream_signal_upstream_done(StreamSpecs *specs, uint64_t done_lsn,
+								 uint64_t confirm_lsn);
 bool stream_recv_upstream_done(StreamSpecs *specs, int pipe_read_fd);
 bool stream_init_context(StreamSpecs *specs);
 bool stream_init_timeline(StreamSpecs *specs, LogicalStreamClient *stream);
@@ -940,6 +956,11 @@ bool stream_replay_reached_endpos(StreamSpecs *specs,
 bool follow_export_snapshot(CopyDataSpec *copySpecs, StreamSpecs *streamSpecs);
 bool follow_setup_databases(CopyDataSpec *copySpecs, StreamSpecs *streamSpecs);
 bool follow_reset_sequences(CopyDataSpec *copySpecs, StreamSpecs *streamSpecs);
+bool follow_restore_fkeys(CopyDataSpec *copySpecs, StreamSpecs *streamSpecs,
+						  bool followed);
+
+bool wal_workers_assign(WalWorkerTable *tables, int count, int workers,
+						const char *highTraffic);
 
 bool follow_init_sentinel(StreamSpecs *specs, CopyDBSentinel *sentinel);
 bool follow_get_sentinel(StreamSpecs *specs,

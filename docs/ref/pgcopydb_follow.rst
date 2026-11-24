@@ -518,6 +518,44 @@ The following options are available to ``pgcopydb follow``:
 
   __ https://www.postgresql.org/docs/current/replication-origins.html
 
+--wal-workers
+
+  Number of processes that receive and apply changes, from 1 to 16.
+  The default is 1, which keeps the replication slot, origin and publication names of a single process.
+  With a value above 1, the follow process supervises N WAL workers, and each of them runs its own receive and apply processes for the tables assigned to it.
+  Worker k, from 1 to N-1, uses the slot ``<slot>_w<k>`` and the origin ``<origin>_w<k>`` while worker 0 keeps the given names, and each published table gets its own publication ``<slot>_t<oid>`` instead of one publication for all tables.
+  Each worker keeps its catalog and its CDC files in the ``w<k>`` sub-directory of the CDC directory.
+
+  The sentinel of the work directory stays the place to control and watch the run.
+  The supervisor copies its endpos and apply settings to every worker, and ``pgcopydb stream sentinel get`` reports the lowest write, flush and replay LSN of all workers.
+  The replay LSN reaches endpos there only once the command is done, see :ref:`wal_workers_endpos` for the one case where it stays below.
+  The command finishes when every worker has reached endpos.
+  Every worker stops before the first transaction that commits past endpos, so a transaction that changes the tables of several workers is applied by all of them or by none.
+  A worker that reached endpos moves its replication slot and origin to endpos, so after a clean finish every origin equals endpos, also for a worker whose tables saw no change.
+  A resume that finds the origin of a worker already at endpos applies nothing and still moves the slot of that worker to endpos once its receive got there, which is safe because an origin gets to endpos only through an applied commit or through that same move.
+  When endpos falls inside the COMMIT record of a transaction, the slot and origin of a worker that gets that transaction stay where that record starts, so the transaction still arrives when endpos is raised.
+  When endpos moves after a worker finished, that worker starts again, and the command fails when endpos is set below what a worker already applied.
+  A worker also fails when it receives changes of a table assigned to another worker, and the command fails when a publication of a worker is missing or publishes a table of another worker, see :ref:`wal_workers_endpos`.
+  A table assigned to no worker, such as a partition created during the run, goes to the worker of its partitioned table, and as with one worker it must exist on the target.
+  When a worker fails, or a signal asks the supervisor to stop, the supervisor stops the other workers and the command exits with an error.
+  A worker also stops when its supervisor exits, and on Linux its receive and apply processes stop when it exits.
+  ``pgcopydb stream cleanup`` drops the slots, publications and origins of every worker.
+
+  The foreign keys stay off the target until every worker reached endpos, because the worker of a referenced table applies a TRUNCATE of that table without the tables of the other workers.
+  The post-data step leaves the foreign keys and their comments out, and once every worker reached endpos a second ``pg_restore`` pass creates and validates them, and keeps ``NOT VALID`` and ``NOT ENFORCED`` as on the source.
+  ``pgcopydb follow`` reads them from ``schema/schema.dump`` in the work directory, as ``pgcopydb clone`` writes it, and fails at endpos when that file is missing.
+  With a target that already has the foreign keys, as after ``pgcopydb clone`` without ``--follow``, a TRUNCATE of a referenced table on the source fails the worker of that table.
+  Exit 0 means that the foreign keys exist, and a command that stops before that, on a signal or an error, exits with an error and logs ``Foreign keys are pending``.
+  See :ref:`resuming_operations` for a rerun.
+
+  A value above 1 requires a source running Postgres 13 or later, the pgoutput plugin, a publication that pgcopydb manages (no ``--publication``), no ``--all-databases``, a slot name of at most 51 bytes and an origin of at most 59 bytes.
+  The slot name and the origin must not end in ``_w<digits>`` or ``_t<digits>``, because WAL workers name their own slots, origins and publications that way.
+
+--wal-high-traffic-tables
+
+  Comma-separated list of ``schema.table`` entries, without spaces, that each get a WAL worker of their own.
+  The list requires ``--wal-workers`` above 1, holds at most as many entries as WAL workers, and names each table once.
+
 --verbose
 
   Increase current verbosity. The default level of verbosity is INFO. In
@@ -562,6 +600,17 @@ PGCOPYDB_WAL2JSON_NUMERIC_AS_STRING
 
   When ``--wal2json-numeric-as-string`` is ommitted from the command line
   then this environment variable is used.
+
+PGCOPYDB_WAL_WORKERS
+
+  Number of WAL workers, from 1 to 16.
+  When ``--wal-workers`` is omitted from the command line, then this environment variable is used.
+  Only ``pgcopydb clone`` and ``pgcopydb follow`` use it: ``pgcopydb snapshot --follow`` always sets up a single WAL worker.
+
+PGCOPYDB_WAL_HIGH_TRAFFIC_TABLES
+
+  Tables that each get a WAL worker of their own.
+  When ``--wal-high-traffic-tables`` is omitted from the command line, then this environment variable is used.
 
 PGCOPYDB_SNAPSHOT
 

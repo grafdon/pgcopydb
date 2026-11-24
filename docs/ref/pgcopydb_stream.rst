@@ -89,6 +89,11 @@ The command ``pgcopydb stream cleanup`` connects to the source and target
 databases to delete the objects created in the ``pgcopydb stream setup``
 step.
 
+When the catalog in the work directory records WAL workers, the command also drops the worker slots ``<slot>_w<k>``, the publications ``<slot>_t<oid>`` and the worker origins ``<origin>_w<k>`` that it lists.
+When the work directory has no catalog that records a replication slot, for instance an empty directory created after the original one was lost, it drops every slot named ``<slot>_w<digits>``, every publication named ``<slot>_t<digits>`` and every origin named ``<origin>_w<digits>``.
+A slot or an origin that is in use makes the command fail.
+When the work directory has a catalog that the command cannot open or read, it fails before it drops anything, rather than drop the WAL worker objects by name pattern.
+
 .. include:: ../include/stream-cleanup.rst
 
 .. _pgcopydb_stream_prune:
@@ -413,7 +418,7 @@ The following options are available to ``pgcopydb stream`` sub-commands:
   ``--host``:``--port`` (use ``0.0.0.0`` to accept connections from other
   hosts/containers). On ``stream sentinel`` get/set (the client side), when set
   the command talks to that coordinator over TCP instead of opening the SQLite
-  catalog directly — so it works without sharing the catalog files. See
+  catalog directly, so it works without sharing the catalog files. See
   :ref:`sentinel_protocol`.
 
   On the server side this may also be provided via the ``PGCOPYDB_HOST``
@@ -457,7 +462,7 @@ The following options are available to ``pgcopydb stream`` sub-commands:
   ``500MB``, ``1GB``, etc.  Defaults to ``1GB``.
 
   A transaction larger than the threshold is always kept intact in one
-  file — rotation only happens at a transaction commit boundary.  This
+  file: rotation only happens at a transaction commit boundary.  This
   means a single oversized transaction causes the file to exceed the
   threshold, which is expected and safe.
 
