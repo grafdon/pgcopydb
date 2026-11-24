@@ -779,6 +779,10 @@ The following options are available to ``pgcopydb clone``:
   the need for superuser to install an extension and works with any
   PostgreSQL publication-based setup.
 
+  With ``--follow`` and pgoutput, pgcopydb creates its publication on the source before it exports the snapshot, unless ``--publication`` names one, and with ``--wal-workers`` above 1 it creates the publications ``<slot>_t<oid>``.
+  The post-data step of ``pgcopydb clone --follow`` does not restore these publications on the target, and it restores every other publication of the source.
+  A ``pgcopydb clone`` without ``--follow``, for example after ``pgcopydb snapshot --follow``, restores them as well.
+
   It is also possible to use `test_decoding`__ or `wal2json`__. Both are
   still supported for backwards compatibility.
 

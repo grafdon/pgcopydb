@@ -35,6 +35,9 @@ static bool copydb_write_restore_list_hook(void *ctx,
 
 static bool copydb_restore_replica_identity(CopyDataSpec *specs);
 
+static bool copydb_write_own_publications(CopyDataSpec *specs,
+										  const char *snapshot);
+
 
 /*
  * copydb_objectid_has_been_processed_already returns true when the given
@@ -121,7 +124,8 @@ copydb_dump_source_schema(CopyDataSpec *specs,
 				 "as \"%s\" already exists",
 				 specs->dumpPaths.dumpFilename);
 	}
-	else if (!pg_dump_db(&(specs->pgPaths),
+	else if (!copydb_write_own_publications(specs, snapshot) ||
+			 !pg_dump_db(&(specs->pgPaths),
 						 &(specs->connStrings),
 						 snapshot,
 						 &(specs->filters),
@@ -708,7 +712,175 @@ typedef struct RestoreListContext
 	bool schemasOnly;   /* write only SCHEMA entries (first pass) */
 	bool fkOnly;        /* write only foreign keys, after endpos */
 	bool prevIsFK;      /* the previous entry is an FK CONSTRAINT */
+	CatalogObject *ownPublications; /* this run's follow made them on the source */
+	int ownPublicationCount;
 } RestoreListContext;
+
+
+/*
+ * copydb_write_own_publications writes the archive objects of the publications
+ * follow created on the source, read in the snapshot of pg_dump: post-data
+ * may run after a published table has been dropped from the source catalog.
+ */
+static bool
+copydb_write_own_publications(CopyDataSpec *specs, const char *snapshot)
+{
+	ReplicationSlot slot = { 0 };
+	bool walWorkers = specs->walWorkers > 1;
+
+	if (!specs->follow)
+	{
+		return true;
+	}
+
+	if (!catalog_read_replication_slot(&(specs->catalogs.source), &slot))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	char *name = walWorkers ? slot.slotName : slot.publicationName;
+
+	/* a --publication given by the user is the user's own object */
+	if (slot.plugin != STREAM_PLUGIN_PGOUTPUT ||
+		(!walWorkers && !slot.publicationAutoManaged) ||
+		IS_EMPTY_STRING_BUFFER(name))
+	{
+		return true;
+	}
+
+	PGSQL src = { 0 };
+	CatalogObject *objects = NULL;
+	int count = 0;
+
+	bool success =
+		pgsql_init(&src, specs->connStrings.source_pguri, PGSQL_CONN_SOURCE) &&
+		pgsql_begin(&src) &&
+		pgsql_set_transaction(&src, ISOLATION_REPEATABLE_READ, true, true) &&
+		(IS_EMPTY_STRING_BUFFER(snapshot) ||
+		 pgsql_set_snapshot(&src, (char *) snapshot)) &&
+		pgsql_list_publication_objects(&src, name, walWorkers, &objects, &count) &&
+		pgsql_commit(&src);
+
+	pgsql_finish(&src);
+
+	if (!success)
+	{
+		log_error("Failed to list the publications that pgcopydb created "
+				  "on the source");
+		free(objects);
+		return false;
+	}
+
+	if (count == 0)
+	{
+		log_warn("Failed to find the publications that pgcopydb created on "
+				 "the source, post-data restores them on the target");
+	}
+
+	PQExpBuffer buf = createPQExpBuffer();
+
+	for (int i = 0; i < count; i++)
+	{
+		appendPQExpBuffer(buf, "%u %u\n", objects[i].catOid, objects[i].objOid);
+	}
+
+	free(objects);
+
+	if (PQExpBufferBroken(buf))
+	{
+		log_error(ALLOCATION_FAILED_ERROR);
+		destroyPQExpBuffer(buf);
+		return false;
+	}
+
+	success = write_file(buf->data, buf->len, specs->dumpPaths.ownPubsFilename);
+
+	destroyPQExpBuffer(buf);
+
+	return success;
+}
+
+
+/*
+ * copydb_read_own_publications reads the file of copydb_write_own_publications,
+ * which a dump taken without follow and pgoutput does not have.
+ */
+static bool
+copydb_read_own_publications(CopyDataSpec *specs, RestoreListContext *context)
+{
+	char *filename = specs->dumpPaths.ownPubsFilename;
+	char *contents = NULL;
+	long size = 0;
+	LinesBuffer lbuf = { 0 };
+
+	if (!specs->follow || !file_exists(filename))
+	{
+		return true;
+	}
+
+	if (!read_file(filename, &contents, &size) || !splitLines(&lbuf, contents))
+	{
+		/* errors have already been logged */
+		free(contents);
+		return false;
+	}
+
+	/* one more slot keeps calloc away from a zero size */
+	context->ownPublications = calloc(lbuf.count + 1, sizeof(CatalogObject));
+
+	bool success = context->ownPublications != NULL;
+
+	if (!success)
+	{
+		log_error(ALLOCATION_FAILED_ERROR);
+	}
+
+	for (uint64_t i = 0; success && i < lbuf.count; i++)
+	{
+		CatalogObject *object = &(context->ownPublications[i]);
+		char *sep = strchr(lbuf.lines[i], ' ');
+
+		if (sep != NULL)
+		{
+			*sep = '\0';
+		}
+
+		success = sep != NULL &&
+				  stringToUInt32(lbuf.lines[i], &(object->catOid)) &&
+				  stringToUInt32(sep + 1, &(object->objOid));
+
+		if (!success)
+		{
+			log_error("Failed to parse line %lld of file \"%s\"",
+					  (long long) i + 1,
+					  filename);
+		}
+	}
+
+	context->ownPublicationCount = success ? lbuf.count : 0;
+
+	free(lbuf.lines);
+	free(contents);
+
+	return success;
+}
+
+
+static int
+catalog_object_cmp(const void *a, const void *b)
+{
+	const CatalogObject *x = (const CatalogObject *) a;
+	const CatalogObject *y = (const CatalogObject *) b;
+
+	if (x->catOid != y->catOid)
+	{
+		return x->catOid < y->catOid ? -1 : 1;
+	}
+
+	return x->objOid < y->objOid ? -1 : x->objOid > y->objOid ? 1 : 0;
+}
+
 
 /*
  * copydb_write_restore_list fetches the pg_restore --list output, parses it,
@@ -787,9 +959,24 @@ copydb_write_restore_list(CopyDataSpec *specs, PostgresDumpSection section)
 		.outStream = out
 	};
 
-	if (!archive_iter_toc(listOutFilename,
-						  &context,
-						  copydb_write_restore_list_hook))
+	/* pg_dump puts publications in post-data */
+	if (section == PG_DUMP_SECTION_POST_DATA &&
+		!copydb_read_own_publications(specs, &context))
+	{
+		log_error("Failed to read the publications that pgcopydb created "
+				  "on the source");
+		free(context.ownPublications);
+		(void) fclose(out);
+		return false;
+	}
+
+	bool success = archive_iter_toc(listOutFilename,
+									&context,
+									copydb_write_restore_list_hook);
+
+	free(context.ownPublications);
+
+	if (!success)
 	{
 		log_error("Failed to prepare the pg_restore list file, "
 				  "see above for details");
@@ -991,6 +1178,26 @@ copydb_write_restore_list_hook(void *ctx, ArchiveContentItem *item)
 				  "reached endpos: %s %s",
 				  item->dumpId,
 				  item->description,
+				  name);
+	}
+
+	CatalogObject key = { .catOid = catOid, .objOid = oid };
+
+	if (!skip &&
+		context->ownPublicationCount > 0 &&
+		bsearch(&key, /* IGNORE-BANNED */
+				context->ownPublications,
+				context->ownPublicationCount,
+				sizeof(CatalogObject),
+				catalog_object_cmp) != NULL)
+	{
+		skip = true;
+
+		log_debug("Skipping publication that pgcopydb created on the source, "
+				  "dumpId %d: %s %u %s",
+				  item->dumpId,
+				  item->description,
+				  item->objectOid,
 				  name);
 	}
 

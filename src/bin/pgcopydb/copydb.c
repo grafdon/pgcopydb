@@ -448,6 +448,9 @@ copydb_prepare_dump_paths(CopyFilePaths *cfPaths, DumpPaths *dumpPaths)
 	sformat(dumpPaths->fkDoneFilename, MAXPGPATH, "%s/%s",
 			cfPaths->schemadir, "fkeys.done");
 
+	sformat(dumpPaths->ownPubsFilename, MAXPGPATH, "%s/%s",
+			cfPaths->schemadir, "own-publications.txt");
+
 	return true;
 }
 

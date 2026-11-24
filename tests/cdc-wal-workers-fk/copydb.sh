@@ -145,11 +145,7 @@ start() {
     dir=/tmp/$1
     log=/tmp/$1.log
 
-    sql "${TGT}" > /dev/null <<'SQL'
-drop schema if exists fk cascade;
-select format('drop publication %I', pubname) from pg_publication
-\gexec
-SQL
+    sql "${TGT}" -c 'drop schema if exists fk cascade' > /dev/null
 
     pgcopydb clone --follow --dir "${dir}" --wal-workers "$2" \
              ${3:+--wal-high-traffic-tables "$3"} > "${log}" 2>&1 &
@@ -172,14 +168,15 @@ resume() {
     pid=$!
 }
 
-# cleanup: drop the slots, publications and origins of the last run
+# cleanup: drop the slots, publications and origins of the last run, whose
+# post-data restored no publication on the target
 cleanup() {
     settled "${label}"
     wait_slots_inactive
     pgcopydb stream cleanup --dir "${dir}" > "${dir}-cleanup.log" 2>&1 ||
         { cat "${dir}-cleanup.log"; echo "FAIL ${label}: cleanup" >&2; exit 1; }
-    check "${label} objects left after cleanup" '0 0 0' \
-          "$(sql "${SRC}" -c 'select count(*) from pg_replication_slots') $(sql "${SRC}" -c 'select count(*) from pg_publication') $(sql "${TGT}" -c 'select count(*) from pg_replication_origin')"
+    check "${label} objects left after cleanup" '0 0 0 0' \
+          "$(sql "${SRC}" -c 'select count(*) from pg_replication_slots') $(sql "${SRC}" -c 'select count(*) from pg_publication') $(sql "${TGT}" -c 'select count(*) from pg_replication_origin') $(sql "${TGT}" -c 'select count(*) from pg_publication')"
 }
 
 pgcopydb ping

@@ -6,6 +6,7 @@ set -euo pipefail
 # with a usage error, one WAL worker keeps today's names and behaviour, three
 # workers get their slots, publications and origins, which stream cleanup
 # drops by catalog or by name pattern, and three workers converge under load.
+# Post-data restores the user's publications on the target, and none of pgcopydb's.
 
 SRC=${PGCOPYDB_SOURCE_PGURI}
 TGT=${PGCOPYDB_TARGET_PGURI}
@@ -15,6 +16,26 @@ INTERNAL=12
 
 sql() { psql -X -q -At -v ON_ERROR_STOP=1 -d "$@"; }
 check() { echo "${1}: want [${2}] got [${3}]"; test "${2}" = "${3}"; }
+
+# the user's publications, two of them near misses of the names of pgcopydb
+USER_PUBS="'userpub', 'pgcopydb_tables', 'pgcopydb_t9x'"
+
+# target_publications label want: post-data restored the user's publications,
+# want lists them as name=tables, and none of the publications of pgcopydb
+target_publications() {
+    check "$1 target publications of pgcopydb" 0 \
+          "$(sql "${TGT}" -c "select count(*) from pg_publication where pubname ~ '^pgcopydb(_t[0-9]+)?$'")"
+    check "$1 target user publications" "$2" \
+          "$(sql "${TGT}" -c "select string_agg(pubname || '=' || tabs, ' ' order by pubname collate \"C\") from (select p.pubname, coalesce(string_agg(t.schemaname || '.' || t.tablename, ',' order by t.tablename), '') as tabs from pg_publication p left join pg_publication_tables t on t.pubname = p.pubname where p.pubname !~ '^pgcopydb(_t[0-9]+)?$' group by p.pubname) x")"
+}
+
+reset_target() {
+    sql "${TGT}" > /dev/null <<'SQL'
+drop schema if exists ww cascade;
+select format('drop publication %I', pubname) from pg_publication
+\gexec
+SQL
+}
 repeat() { printf "%${2}s" '' | tr ' ' "$1"; }
 
 # pgrep exits 1 when nothing matches, and 2 or more when it failed to look
@@ -153,15 +174,13 @@ create table ww.a(id integer primary key, v text);
 create table ww.b(id integer primary key, n bigint);
 insert into ww.a select i, md5(i::text) from generate_series(1, 1000) i;
 insert into ww.b select i, i * 2 from generate_series(1, 1000) i;
+create publication userpub for table ww.a;
+create publication pgcopydb_tables for table ww.b;
 EOF
 
 run() {
     local label=$1 dir=/tmp/run-$1 log=/tmp/run-$1.log pid rc=124
     shift
-
-    # the previous run's post-data restore copied the publication as well
-    sql "${TGT}" -c 'drop schema if exists ww cascade' \
-                 -c 'drop publication if exists pgcopydb'
 
     "$@" --dir "${dir}" > "${log}" 2>&1 &
     pid=$!
@@ -208,7 +227,8 @@ run() {
     check "${label} slots" 'pgcopydb:pgoutput' \
           "$(sql "${SRC}" -c "select string_agg(slot_name || ':' || plugin, ',') from pg_replication_slots")"
     check "${label} publications" pgcopydb \
-          "$(sql "${SRC}" -c "select string_agg(pubname, ',') from pg_publication")"
+          "$(sql "${SRC}" -c "select string_agg(pubname, ',') from pg_publication where pubname not in (${USER_PUBS})")"
+    target_publications "${label}" 'pgcopydb_tables=ww.b userpub=ww.a'
     check "${label} origins" pgcopydb \
           "$(sql "${TGT}" -c "select string_agg(roname, ',') from pg_replication_origin")"
 
@@ -226,14 +246,16 @@ run() {
     fi
 
     check "${label} objects left after cleanup" '0 0 0' \
-          "$(sql "${SRC}" -c 'select count(*) from pg_replication_slots') $(sql "${SRC}" -c 'select count(*) from pg_publication') $(sql "${TGT}" -c 'select count(*) from pg_replication_origin')"
+          "$(sql "${SRC}" -c 'select count(*) from pg_replication_slots') $(sql "${SRC}" -c "select count(*) from pg_publication where pubname not in (${USER_PUBS})") $(sql "${TGT}" -c 'select count(*) from pg_replication_origin')"
 
     echo "OK run ${label}"
 }
 
+reset_target
 run env env PGCOPYDB_WAL_WORKERS=1 pgcopydb clone --follow
 
 # the option wins over the environment; -vv logs the SQL of the publication
+reset_target
 run option env PGCOPYDB_WAL_WORKERS=16 pgcopydb clone --follow --wal-workers 1 -vv
 
 # the single publication keeps today's SQL text, byte for byte
@@ -245,6 +267,20 @@ for stmt in "SELECT schemaname, tablename FROM pg_tables WHERE schemaname NOT IN
     fi
 done
 echo "OK one-worker publication SQL"
+
+# post-data fails once on the userpub of the target, and its resume runs every
+# user publication entry again; the PUBLICATION TABLE entry of pgcopydb for a
+# table dropped from the source before the resume stays skipped
+sql "${SRC}" -c 'create table ww.gone(id integer primary key)'
+reset_target
+sql "${TGT}" -c 'create publication userpub'
+expect "${INTERNAL}" 'publication "userpub" already exists' /tmp/run-gone-first.log \
+       pgcopydb clone --follow --dir /tmp/run-gone
+no_pgcopydb 'a failed post-data'
+wait_slots_inactive
+sql "${SRC}" -c 'drop table ww.gone'
+sql "${TGT}" -c 'drop publication userpub, pgcopydb_tables'
+run gone pgcopydb clone --follow --resume --not-consistent
 
 # snapshot --follow sets up one worker, whatever its environment says
 env PGCOPYDB_WAL_WORKERS=2 PGCOPYDB_WAL_HIGH_TRAFFIC_TABLES=ww.a \
@@ -264,7 +300,7 @@ fi
 check 'snapshot --follow slots' 'pgcopydb:pgoutput' \
       "$(sql "${SRC}" -c "select string_agg(slot_name || ':' || plugin, ',') from pg_replication_slots")"
 check 'snapshot --follow publications' pgcopydb \
-      "$(sql "${SRC}" -c "select string_agg(pubname, ',') from pg_publication")"
+      "$(sql "${SRC}" -c "select string_agg(pubname, ',') from pg_publication where pubname not in (${USER_PUBS})")"
 kill -TERM "${snapshot_pid}"
 wait "${snapshot_pid}"
 wait_slots_inactive
@@ -277,6 +313,8 @@ sql "${SRC}" -c "select pg_drop_replication_slot('pgcopydb')" \
 S=pgcopydb
 
 sql "${SRC}" <<'SQL'
+drop publication userpub;
+drop publication pgcopydb_tables;
 drop schema ww cascade;
 create schema ww;
 create table ww.p(id integer, v text) partition by range (id);
@@ -535,6 +573,8 @@ insert into cv.acct select i, 1000 from generate_series(0, 99) i;
 insert into cv.evt select i, 'seed' from generate_series(-100, 0) i;
 insert into cv.p select i, i, 'seed' from generate_series(0, 999) i;
 insert into cv.g(id, a) select i, i from generate_series(1, 100) i;
+create publication userpub for table cv.acct;
+create publication pgcopydb_t9x for table cv.evt;
 SQL
 
 CV_TABLES='cv.acct cv.evt cv.g cv.hot cv.p1 cv.p2'
@@ -733,6 +773,7 @@ check 'per-table counts and contents' "$(counts "${SRC}")" "$(counts "${TGT}")"
 check 'keyless duplicates kept' t \
       "$(sql "${TGT}" -c "select count(*) > count(distinct (id, kind)) from cv.evt")"
 pgcopydb compare data --dir /tmp/cv-compare
+target_publications convergence 'pgcopydb_t9x=cv.evt userpub=cv.acct'
 
 # every table went to exactly one worker, cv.hot to a worker of its own
 check 'worker of cv.hot' '0:1' \
@@ -930,4 +971,4 @@ wait_slots_inactive
 expect 0 "Dropping replication slot \"${S}_w2\"" /tmp/kill-cleanup.log \
        pgcopydb stream cleanup --dir "${dir}"
 check 'objects left at the end' '0 0 0' \
-      "$(sql "${SRC}" -c 'select count(*) from pg_replication_slots') $(sql "${SRC}" -c 'select count(*) from pg_publication') $(sql "${TGT}" -c 'select count(*) from pg_replication_origin')"
+      "$(sql "${SRC}" -c 'select count(*) from pg_replication_slots') $(sql "${SRC}" -c "select count(*) from pg_publication where pubname not in (${USER_PUBS})") $(sql "${TGT}" -c 'select count(*) from pg_replication_origin')"
