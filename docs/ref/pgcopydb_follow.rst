@@ -532,9 +532,11 @@ The following options are available to ``pgcopydb follow``:
   The command finishes when every worker has reached endpos.
   Every worker stops before the first transaction that commits past endpos, so a transaction that changes the tables of several workers is applied by all of them or by none.
   A worker that reached endpos moves its replication slot and origin to endpos, so after a clean finish every origin equals endpos, also for a worker whose tables saw no change.
+  A resume that finds the origin of a worker already at endpos applies nothing and still moves the slot of that worker to endpos once its receive got there, which is safe because an origin gets to endpos only through an applied commit or through that same move.
   When endpos falls inside the COMMIT record of a transaction, the slot and origin of a worker that gets that transaction stay where that record starts, so the transaction still arrives when endpos is raised.
   When endpos moves after a worker finished, that worker starts again, and the command fails when endpos is set below what a worker already applied.
-  A worker also fails when it receives changes of a table assigned to another worker or to none, such as a partition created during the run, and the command fails when a publication of a worker is missing or publishes other tables, see :ref:`wal_workers_endpos`.
+  A worker also fails when it receives changes of a table assigned to another worker, and the command fails when a publication of a worker is missing or publishes a table of another worker, see :ref:`wal_workers_endpos`.
+  A table assigned to no worker, such as a partition created during the run, goes to the worker of its partitioned table, and as with one worker it must exist on the target.
   When a worker fails, or a signal asks the supervisor to stop, the supervisor stops the other workers and the command exits with an error.
   A worker also stops when its supervisor exits, and on Linux its receive and apply processes stop when it exits.
   ``pgcopydb stream cleanup`` drops the slots, publications and origins of every worker.

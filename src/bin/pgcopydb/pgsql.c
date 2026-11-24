@@ -5937,13 +5937,13 @@ pgsql_replication_slot_advance(PGSQL *pgsql, const char *slotName,
 
 /*
  * pgsql_wal_worker_publications_mismatch describes in mismatch the first way
- * the publications <slotName>_t<oid> of the given oids differ from those
- * tables, or leaves it empty. A partitioned table publishes its leaves only.
+ * the publications <slotName>_t<oid> of oids miss one of them or publish one
+ * of others, or leaves it empty. A partitioned table publishes its leaves.
  */
 bool
 pgsql_wal_worker_publications_mismatch(PGSQL *pgsql, const char *slotName,
-									   const char *oids, char *mismatch,
-									   size_t size)
+									   const char *oids, const char *others,
+									   char *mismatch, size_t size)
 {
 	SingleValueResultContext context = { { 0 }, PGSQL_RESULT_STRING, false };
 
@@ -5970,10 +5970,12 @@ pgsql_wal_worker_publications_mismatch(PGSQL *pgsql, const char *slotName,
 		" order by a.oid limit 1),"
 		"  (select format('table with oid %s does not exist', a.oid)"
 		"     from a where a.relkind is null order by a.oid limit 1),"
-		"  (select format('publication \"%s\" publishes table %s, "
-		"which is not assigned to this worker', got.pubname, got.qname)"
+		"  (select format('publication \"%s\" publishes table %s, which %s',"
+		"                 got.pubname, got.qname,"
+		"                 case when got.oid is null then 'is not found'"
+		"                      else 'is assigned to another worker' end)"
 		"     from got"
-		"    where got.oid is null or got.oid not in (select oid from a)"
+		"    where got.oid is null or got.oid = any($3::oid[])"
 		" order by got.pubname, got.qname limit 1),"
 		"  (select format('table %s is in no publication', a.oid::regclass)"
 		"     from a"
@@ -5982,10 +5984,10 @@ pgsql_wal_worker_publications_mismatch(PGSQL *pgsql, const char *slotName,
 		" order by a.oid limit 1),"
 		"  '')";
 
-	Oid paramTypes[2] = { TEXTOID, TEXTOID };
-	const char *paramValues[2] = { slotName, oids };
+	Oid paramTypes[3] = { TEXTOID, TEXTOID, TEXTOID };
+	const char *paramValues[3] = { slotName, oids, others };
 
-	if (!pgsql_execute_with_params(pgsql, sql, 2, paramTypes, paramValues,
+	if (!pgsql_execute_with_params(pgsql, sql, 3, paramTypes, paramValues,
 								   &context, &parseSingleValueResult) ||
 		!context.parsedOk || context.isNull)
 	{

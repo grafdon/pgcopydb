@@ -381,6 +381,17 @@ workers() {
         exit 1
     fi
     kill "-${sig}" "${pid}"
+    for _ in $(seq 120); do
+        kill -0 "${pid}" 2> /dev/null || break
+        sleep 0.5
+    done
+    if kill -0 "${pid}" 2> /dev/null; then
+        pkill -KILL -f '^pgcopydb: ' 2> /dev/null || true
+        kill -KILL "${pid}" 2> /dev/null || true
+        cat "${log}"
+        echo "FAIL: SIG${sig} did not stop $* within 60 s" >&2
+        exit 1
+    fi
     wait "${pid}" || rc=$?
     if [ "${rc}" -eq 0 ] || ! grep -qF 'stopping 3 WAL workers' "${log}"; then
         cat "${log}"

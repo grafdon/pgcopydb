@@ -957,7 +957,7 @@ cli_follow(int argc, char **argv)
 				 LSN_FORMAT_ARGS(sentinel.endpos),
 				 LSN_FORMAT_ARGS(sentinel.replay_lsn));
 
-		/* a run stopped after endpos may have left the foreign keys */
+		/* a run stopped after endpos may not have created the foreign keys */
 		if (!follow_restore_fkeys(&copySpecs, &specs, true))
 		{
 			/* errors have already been logged */

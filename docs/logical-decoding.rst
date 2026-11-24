@@ -321,7 +321,8 @@ Apply then waits until the walsender of receive releases the slot and calls ``pg
 Apply sends that commit as one simple query, as it does for a group of applied transactions, and reads its result before it goes on: a target session lost meanwhile fails the worker instead of marking it done.
 We move the slot first, so that a stop or an error between the two steps leaves the origin behind, and the next run moves both again.
 Only then does apply mark itself ``'done'`` at endpos; a stop by a signal, an error, or a missing condition marks it ``'error'``.
-A resume that finds the origin already at endpos goes through the same steps, so it also moves a slot that an interrupted run left below endpos.
+A resume that finds the origin of a worker already at endpos has nothing to apply, so the second condition holds, and it moves the slot of that worker to endpos once the other two hold, as after a run that applied a commit at endpos and stopped before it moved the slot.
+This is safe because an origin reaches endpos only through an applied commit or through this move, so the target already has every transaction that commits at or below endpos.
 
 Endpos can fall inside the COMMIT record of a transaction, as a hand-typed LSN or a flush position at a page boundary can.
 That transaction commits past endpos, and receive drops its COMMIT, but the walsender decides to skip a transaction by where its COMMIT record starts.
@@ -339,8 +340,10 @@ When endpos is set below the ``replay_lsn`` of a worker, the run fails, because 
 
 Two guards stop a run that would otherwise duplicate or lose changes:
 
-- Receive fails on a RELATION message for a table that the assignment gives to another worker or to none, as when a table of one worker is attached as a partition of a partitioned table of another worker.
-- Each worker at start, and the supervisor before it reports done, checks that the publications of each worker exist and publish its tables and no other.
+- Receive fails on a RELATION message for a table that the assignment gives to another worker, as when a table of one worker is attached as a partition of a partitioned table of another worker.
+  A table that the assignment gives to no worker, such as a partition created during the run, comes only through the publication of its partitioned table, so its worker applies it as one worker would, and logs a NOTICE.
+  Receive fails instead when the catalog of its worker holds no assignment at all, which would otherwise read every table as assigned to no worker.
+- Each worker at start, and the supervisor before it reports done, checks that the publications of each worker exist, publish its tables, and publish no table of another worker.
   Postgres 18 skips a dropped publication with a warning and streams on, which would lose the changes of its table without an error.
 
 .. _pipe_protocol:

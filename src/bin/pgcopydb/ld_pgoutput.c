@@ -160,6 +160,7 @@ typedef struct WalWorkerLookup
 	uint32_t oid;
 	WalWorkerTable table;
 	bool found;
+	int rows;
 } WalWorkerLookup;
 
 
@@ -167,6 +168,8 @@ static bool
 pgoutput_find_wal_worker_table(void *context, WalWorkerTable *table)
 {
 	WalWorkerLookup *lookup = (WalWorkerLookup *) context;
+
+	++(lookup->rows);
 
 	if (table->oid == lookup->oid)
 	{
@@ -180,8 +183,8 @@ pgoutput_find_wal_worker_table(void *context, WalWorkerTable *table)
 
 /*
  * pgoutput_check_wal_worker stops a WAL worker that receives a table assigned
- * to another worker, such as an attached partition: two workers would apply
- * its changes, and the endpos cut of one would not hold for the other.
+ * to another worker, which would apply its changes twice. A table assigned to
+ * none, such as a new partition, comes only through its root's publication.
  */
 static bool
 pgoutput_check_wal_worker(StreamContext *privateContext, uint32_t relOid,
@@ -213,26 +216,37 @@ pgoutput_check_wal_worker(StreamContext *privateContext, uint32_t relOid,
 		return false;
 	}
 
-	if (lookup.found && lookup.table.worker == specs->walWorkerIndex)
+	/* an empty assignment would read every table as assigned to none */
+	if (lookup.rows == 0)
+	{
+		privateContext->fatal = true;
+
+		log_fatal("WAL worker %d receives changes of table %s.%s (oid %u), "
+				  "and its catalog \"%s\" assigns no table to any WAL worker",
+				  specs->walWorkerIndex, nspname, relname, relOid,
+				  sourceDB->dbfile);
+		return false;
+	}
+
+	if (!lookup.found)
+	{
+		log_notice("WAL worker %d receives changes of table %s.%s (oid %u), "
+				   "which is assigned to no WAL worker",
+				   specs->walWorkerIndex, nspname, relname, relOid);
+		return true;
+	}
+
+	if (lookup.table.worker == specs->walWorkerIndex)
 	{
 		return true;
 	}
 
 	privateContext->fatal = true;
 
-	if (lookup.found)
-	{
-		log_fatal("WAL worker %d receives changes of table %s.%s (oid %u), "
-				  "which is assigned to WAL worker %d",
-				  specs->walWorkerIndex, nspname, relname, relOid,
-				  lookup.table.worker);
-	}
-	else
-	{
-		log_fatal("WAL worker %d receives changes of table %s.%s (oid %u), "
-				  "which is assigned to no WAL worker",
-				  specs->walWorkerIndex, nspname, relname, relOid);
-	}
+	log_fatal("WAL worker %d receives changes of table %s.%s (oid %u), "
+			  "which is assigned to WAL worker %d",
+			  specs->walWorkerIndex, nspname, relname, relOid,
+			  lookup.table.worker);
 
 	return false;
 }
@@ -269,12 +283,6 @@ pgoutput_cache_relation(StreamContext *privateContext,
 		return false;
 	}
 
-	if (!pgoutput_check_wal_worker(privateContext, relOid, nspname, relname))
-	{
-		/* errors have already been logged */
-		return false;
-	}
-
 	uint8_t replident = pgout_u8(buf, &pos, bufLen);
 
 	int16_t natts = pgout_i16(buf, &pos, bufLen);
@@ -288,6 +296,13 @@ pgoutput_cache_relation(StreamContext *privateContext,
 		log_debug("pgoutput: relation %u already cached, skipping R message",
 				  relOid);
 		return true;
+	}
+
+	/* a cached relation passed already, and the assignment never changes */
+	if (!pgoutput_check_wal_worker(privateContext, relOid, nspname, relname))
+	{
+		/* errors have already been logged */
+		return false;
 	}
 
 	rel = (PgoutputRelationCache *) calloc(1, sizeof(PgoutputRelationCache));

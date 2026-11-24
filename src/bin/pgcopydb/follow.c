@@ -1892,6 +1892,7 @@ typedef struct WalWorkerOids
 {
 	int worker;
 	PQExpBuffer oids;
+	PQExpBuffer others;
 } WalWorkerOids;
 
 
@@ -1899,13 +1900,9 @@ static bool
 follow_add_wal_worker_oid(void *context, WalWorkerTable *table)
 {
 	WalWorkerOids *ctx = (WalWorkerOids *) context;
+	PQExpBuffer oids = table->worker == ctx->worker ? ctx->oids : ctx->others;
 
-	if (table->worker == ctx->worker)
-	{
-		appendPQExpBuffer(ctx->oids, "%s%u",
-						  ctx->oids->len > 1 ? "," : "",
-						  table->oid);
-	}
+	appendPQExpBuffer(oids, "%s%u", oids->len > 1 ? "," : "", table->oid);
 
 	return true;
 }
@@ -1913,8 +1910,8 @@ follow_add_wal_worker_oid(void *context, WalWorkerTable *table)
 
 /*
  * follow_check_wal_worker_publications fails unless the publications of a WAL
- * worker exist and publish its tables only: Postgres 18 streams on without a
- * dropped publication, and the changes of its table would be lost silently.
+ * worker exist and publish its tables, and none of another worker: Postgres 18
+ * streams on without a dropped publication, losing the changes of its table.
  */
 static bool
 follow_check_wal_worker_publications(DatabaseCatalog *catalog,
@@ -1922,34 +1919,45 @@ follow_check_wal_worker_publications(DatabaseCatalog *catalog,
 									 const char *slotName,
 									 int worker)
 {
-	WalWorkerOids ctx = { .worker = worker, .oids = createPQExpBuffer() };
+	WalWorkerOids ctx = {
+		.worker = worker,
+		.oids = createPQExpBuffer(),
+		.others = createPQExpBuffer()
+	};
 	char mismatch[BUFSIZE] = { 0 };
 	PGSQL src = { 0 };
 
-	if (ctx.oids == NULL)
+	if (ctx.oids == NULL || ctx.others == NULL)
 	{
 		log_error(ALLOCATION_FAILED_ERROR);
+		destroyPQExpBuffer(ctx.oids);
+		destroyPQExpBuffer(ctx.others);
 		return false;
 	}
 
 	appendPQExpBufferChar(ctx.oids, '{');
+	appendPQExpBufferChar(ctx.others, '{');
 
 	bool success =
 		catalog_iter_wal_worker_table(catalog, &ctx,
 									  &follow_add_wal_worker_oid);
 
 	appendPQExpBufferChar(ctx.oids, '}');
+	appendPQExpBufferChar(ctx.others, '}');
 
 	success = success &&
 			  !PQExpBufferBroken(ctx.oids) &&
+			  !PQExpBufferBroken(ctx.others) &&
 			  pgsql_init(&src, connStrings->source_pguri, PGSQL_CONN_SOURCE) &&
 			  pgsql_wal_worker_publications_mismatch(&src, slotName,
 													 ctx.oids->data,
+													 ctx.others->data,
 													 mismatch,
 													 sizeof(mismatch));
 
 	(void) pgsql_finish(&src);
 	destroyPQExpBuffer(ctx.oids);
+	destroyPQExpBuffer(ctx.others);
 
 	if (!success)
 	{

@@ -596,6 +596,7 @@ bool pgsql_replication_slot_advance(PGSQL *pgsql,
 bool pgsql_wal_worker_publications_mismatch(PGSQL *pgsql,
 											const char *slotName,
 											const char *oids,
+											const char *others,
 											char *mismatch,
 											size_t size);
 bool pgsql_drop_wal_worker_slots(PGSQL *pgsql, const char *slotName);

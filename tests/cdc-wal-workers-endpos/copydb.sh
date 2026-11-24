@@ -3,11 +3,11 @@
 set -euo pipefail
 
 # Every WAL worker stops at one endpos: a transaction across two workers lands
-# in both or neither, a moved endpos starts a finished worker again, also one
-# whose endpos fell inside a COMMIT record, one below applied changes fails, a
-# clean finish leaves every origin and slot at endpos, a signal or a lost target
-# session moves no unfinished worker there, and the RELATION and publication
-# guards stop a lossy run. ep.k has no key, so a duplicate shows as a count.
+# in both or neither, a moved endpos restarts a finished worker, also one that
+# stopped inside a COMMIT record, one below applied changes fails, a clean end
+# leaves origins and slots at endpos, a signal, a lost session or a commit left
+# in the spool moves no unfinished worker there, and the guards stop a lossy run
+# but take a new partition. ep.k has no key, so a duplicate shows as a count.
 
 SRC=${PGCOPYDB_SOURCE_PGURI}
 TGT=${PGCOPYDB_TARGET_PGURI}
@@ -71,6 +71,11 @@ lsn_cmp() { sql "${SRC}" -c "select '$1'::pg_lsn $2 '$3'::pg_lsn"; }
 worker_sentinel() {
     sqlite3 -readonly -init /dev/null -batch -noheader "${dir}/cdc/w$1/source.db" \
             "select coalesce($2, '0/0') from sentinel"
+}
+
+receive_state() {
+    sqlite3 -readonly -init /dev/null -batch -noheader "${dir}/cdc/w$1/source.db" \
+            "select run_state from pipeline_state where process_name = 'receive'"
 }
 
 # origins: name=t|f per worker origin, t when it is at the given LSN
@@ -609,6 +614,81 @@ cleanup
 echo "OK a resume moved the origin of the lost session to endpos"
 
 #
+# a commit below endpos left in the spool when the apply loop stops: the drain
+# gate moves neither the slot nor the origin of its worker to endpos and fails
+# the run, and a resume applies it; gdb makes the loop miss that commit once
+#
+start drain 3 "${HT}"
+E=$(sql "${SRC}" -c 'select pg_current_wal_insert_lsn() + 1048576')
+e=$(( (16#${E%/*} << 32) + 16#${E#*/} ))
+pgcopydb stream sentinel set endpos --dir "${dir}" "${E}" > /dev/null
+wait_worker 1 endpos "${E}"
+worker_pids 1
+
+# hold apply where its loop asks what is left below endpos, then answer nothing
+rm -f /tmp/drain.held /tmp/drain.go
+timeout 300 sudo -n gdb -q -nx -batch -p "${apply}" \
+    -ex 'set pagination off' -ex 'set confirm off' \
+    -ex "break ld_store_lookup_output_complete_txn if endpos == ${e}" \
+    -ex continue -ex 'print endpos' \
+    -ex 'shell touch /tmp/drain.held; for i in $(seq 600); do [ -e /tmp/drain.go ] && break; sleep 0.2; done' \
+    -ex 'return 1' -ex delete -ex detach > /tmp/drain-gdb.log 2>&1 &
+gdb=$!
+for _ in $(seq 120); do
+    [ -e /tmp/drain.held ] && break
+    sleep 0.5
+done
+[ -e /tmp/drain.held ] || { cat /tmp/drain-gdb.log; fail 'gdb did not hold the apply of worker 1'; }
+
+pre=$(sql "${SRC}" -c 'select pg_current_wal_insert_lsn()')
+xid=$(sql "${SRC}" <<'SQL'
+begin;
+insert into ep.b values (1001, 'spooled');
+select txid_current() % 4294967296;
+commit;
+SQL
+)
+read -r _ c < <(commit_record "${pre}" "${xid}") || fail 'no COMMIT record of 1001 on ep.b'
+check 'COMMIT of 1001 below endpos' t "$(lsn_cmp "${c}" '<' "${E}")"
+for _ in $(seq 8); do
+    [ "$(lsn_cmp "$(flush_lsn)" '>=' "${E}")" = t ] && break
+    sql "${WAL}" -c 'insert into pad values (1)' -c 'select pg_switch_wal()' > /dev/null
+done
+check "WAL past endpos ${E}" t "$(lsn_cmp "$(flush_lsn)" '>=' "${E}")"
+for _ in $(seq 60); do
+    [ "$(receive_state 1)" = 'done' ] && break
+    sleep 0.5
+done
+check 'receive of worker 1 done while its apply is held' 'done' "$(receive_state 1)"
+check 'COMMIT of 1001 in the spool of worker 1' 1 "$(spooled 1 "action = 'C' and xid = ${xid}")"
+check 'row 1001 on the target while apply is held' 0 "$(sql "${TGT}" -c 'select count(*) from ep.b where id = 1001')"
+touch /tmp/drain.go
+wait "${gdb}" || { cat /tmp/drain-gdb.log; fail 'gdb failed'; }
+grep -F " = ${e}" /tmp/drain-gdb.log || { cat /tmp/drain-gdb.log; fail "gdb held the apply before it read endpos ${E}"; }
+
+finish 120
+[ "${rc}" -ne 0 ] && [ "${rc}" -ne 124 ] || fail "a commit left in the spool left exit ${rc}"
+grep -E "Apply stopped at [0-9A-F]+/[0-9A-F]+ while outputDB still holds xid ${xid} committing at" "${log}" ||
+    fail 'the drain gate did not stop worker 1'
+settled 'a commit left in the spool'
+wait_slots_inactive
+check 'row 1001 on the target' 0 "$(sql "${TGT}" -c 'select count(*) from ep.b where id = 1001')"
+check 'origin and slot of worker 1 below endpos' 't t' \
+      "$(lsn_cmp "$(sql "${TGT}" -c "select pg_replication_origin_progress('${S}_w1', true)")" '<' "${E}") $(lsn_cmp "$(slot_lsn "${S}_w1")" '<' "${E}")"
+echo "OK a commit left in the spool moved nothing to endpos, exit ${rc}"
+
+resume
+finish 120
+[ "${rc}" -eq 0 ] || fail "follow --resume exit ${rc}"
+check 'row 1001 after the resume' 1 "$(sql "${TGT}" -c 'select count(*) from ep.b where id = 1001')"
+canary
+wait_slots_inactive
+check 'origins at endpos after the resume' "${S}=t ${S}_w1=t ${S}_w2=t" "$(origins_at "${E}")"
+check 'slots at endpos after the resume' "${S}=t ${S}_w1=t ${S}_w2=t" "$(slots_at "${E}")"
+cleanup
+echo "OK a resume applied the commit that the drain gate kept"
+
+#
 # a publication dropped during the run: its changes do not reach the worker,
 # so the run fails instead of finishing, and so does a resume at its start
 #
@@ -644,6 +724,28 @@ cleanup
 echo "OK a dropped publication fails the run"
 
 #
+# a publication of worker 2 that also publishes ep.a of worker 0, with no
+# change of ep.a after it: the check before done fails the run
+#
+start pubother 3 "${HT}"
+check 'workers of ep.a and ep.c' '0 2' \
+      "$(sqlite3 -readonly -init /dev/null -batch -noheader "${dir}/schema/source.db" \
+         "select group_concat(worker, ' ') from (select worker from wal_worker_table where relname in ('a', 'c') order by relname)")"
+pub=${S}_t$(sql "${SRC}" -c "select 'ep.c'::regclass::oid")
+sql "${SRC}" -c "alter publication ${pub} add table ep.a" \
+             -c "insert into ep.b values (1201, 'w')" -c "insert into ep.c values (1201, 'w')"
+e=$(flush_lsn)
+pgcopydb stream sentinel set endpos --dir "${dir}" "${e}" > /dev/null
+finish 120
+if [ "${rc}" -eq 0 ] || [ "${rc}" -eq 124 ] ||
+   ! grep -F "Failed to check the publications of WAL worker 2: publication \"${pub}\" publishes table ep.a, which is assigned to another worker" "${log}"; then
+    fail "a publication of a table of another worker left exit ${rc}"
+fi
+check 'workers reaching endpos' 3 "$(grep -c "has reached endpos ${e}\$" "${log}")"
+cleanup
+echo "OK a publication of a table of another worker fails the run, exit ${rc}"
+
+#
 # a table of worker 0 attached as a partition of a table of worker 1 reaches
 # both: receive of worker 1 stops on its RELATION message
 #
@@ -662,5 +764,51 @@ fi
 sql "${SRC}" -c 'alter table ep.r detach partition ep.x'
 cleanup
 echo "OK a table that reaches two workers stops the run, exit ${rc}"
+
+#
+# a worker catalog that lost its assignment during the run: receive of worker
+# 2 stops on its next RELATION message instead of taking every table
+#
+start norows 3 "${HT}"
+sqlite3 -init /dev/null -batch -cmd '.timeout 10000' "${dir}/cdc/w2/source.db" \
+        'delete from wal_worker_table'
+sql "${SRC}" -c "insert into ep.c values (1301, 'w')"
+e=$(flush_lsn)
+pgcopydb stream sentinel set endpos --dir "${dir}" "${e}" > /dev/null
+finish 120
+c=$(sql "${SRC}" -c "select 'ep.c'::regclass::oid")
+if [ "${rc}" -eq 0 ] || [ "${rc}" -eq 124 ] ||
+   ! grep -E "WAL worker 2 receives changes of table ep\.c \(oid ${c}\), and its catalog \".*/w2/source\.db\" assigns no table to any WAL worker" "${log}"; then
+    fail "a worker catalog without assignment left exit ${rc}"
+fi
+cleanup
+echo "OK a worker catalog without assignment stops the run, exit ${rc}"
+
+#
+# a partition created during the run is assigned to no worker: the worker of
+# its partitioned table applies it, as one worker would
+#
+start partition 3 "${HT}"
+part='create table ep.r2 partition of ep.r for values from (2000000) to (3000000)'
+sql "${TGT}" -c "${part}"
+sql "${SRC}" -c "${part}" \
+             -c "insert into ep.r select i, 'new' from generate_series(2000001, 2000100) i" \
+             -c "update ep.r set v = 'updated' where id between 2000001 and 2000010" \
+             -c "delete from ep.r where id between 2000091 and 2000100" \
+             -c "insert into ep.a values (1101, 'w')" -c "insert into ep.k values (1101, 'w')"
+check 'worker of ep.r, and rows of ep.r2 in the assignment' '2:0' \
+      "$(sqlite3 -readonly -init /dev/null -batch -noheader "${dir}/schema/source.db" \
+         "select (select worker from wal_worker_table where relname = 'r') || ':' || (select count(*) from wal_worker_table where relname = 'r2')")"
+e=$(flush_lsn)
+pgcopydb stream sentinel set endpos --dir "${dir}" "${e}" > /dev/null
+finish 120
+[ "${rc}" -eq 0 ] || fail "a partition created during the run left exit ${rc}"
+check 'rows of ep.r2 on the target' '90 10' \
+      "$(sql "${TGT}" -F ' ' -c "select count(*), count(*) filter (where v = 'updated') from ep.r2")"
+canary
+pgcopydb compare data --dir /tmp/partition-compare > /tmp/partition-compare.log 2>&1 ||
+    { cat /tmp/partition-compare.log; fail 'compare data after a new partition'; }
+cleanup
+echo "OK a partition created during the run reaches the worker of its partitioned table"
 
 no_pgcopydb 'the suite'
