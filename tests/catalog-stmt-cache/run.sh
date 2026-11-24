@@ -1,7 +1,7 @@
 #! /bin/bash
 
-# Links stmt-cache.c against the pgcopydb objects of the image build and runs
-# it. SANITIZE=address rebuilds those objects with that sanitizer first.
+# Links each test program here against the pgcopydb objects of the image build
+# and runs it. SANITIZE=address rebuilds those objects with that sanitizer first.
 
 set -euo pipefail
 
@@ -25,7 +25,9 @@ done
 
 # main.c defines globals the other objects use, so it links without its main()
 "${cc[@]}" -Dmain=pgcopydb_main -Wno-missing-prototypes -c main.c -o /tmp/main.o
-"${cc[@]}" -I. -c "${here}/stmt-cache.c" -o /tmp/stmt-cache.o
-"${cc[@]}" /tmp/stmt-cache.o /tmp/main.o "${objs[@]}" "${libs[@]}" -o /tmp/stmt-cache
 
-ASAN_OPTIONS=${ASAN_OPTIONS:-detect_leaks=0} /tmp/stmt-cache
+for name in stmt-cache pgoutput-store; do
+    "${cc[@]}" -I. -c "${here}/${name}.c" -o "/tmp/${name}.o"
+    "${cc[@]}" "/tmp/${name}.o" /tmp/main.o "${objs[@]}" "${libs[@]}" -o "/tmp/${name}"
+    ASAN_OPTIONS=${ASAN_OPTIONS:-detect_leaks=0} "/tmp/${name}"
+done

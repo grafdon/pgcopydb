@@ -1860,7 +1860,7 @@ ld_store_insert_message(DatabaseCatalog *catalog,
 
 	SQLiteQuery query = { 0 };
 
-	if (!catalog_sql_prepare(db, sql, &query))
+	if (!catalog_sql_prepare_cached(catalog, sql, &query))
 	{
 		/* errors have already been logged */
 		(void) semaphore_unlock(&(catalog->sema));
@@ -1949,7 +1949,7 @@ ld_store_insert_pgoutput_message(DatabaseCatalog *catalog,
 		{ BIND_PARAMETER_TYPE_INT64, "seq", metadata->seq, NULL }
 	};
 
-	if (!catalog_sql_prepare(db, delete_sql, &dq) ||
+	if (!catalog_sql_prepare_cached(catalog, delete_sql, &dq) ||
 		!catalog_sql_bind(&dq, dparams, lengthof(dparams)) ||
 		!catalog_sql_execute_once(&dq))
 	{
@@ -1964,7 +1964,7 @@ ld_store_insert_pgoutput_message(DatabaseCatalog *catalog,
 		"  values($1, $2, $3, $4, NULL, $5, $6, $7, $8)";
 
 	SQLiteQuery oq = { 0 };
-	if (!catalog_sql_prepare(db, output_sql, &oq))
+	if (!catalog_sql_prepare_cached(catalog, output_sql, &oq))
 	{
 		(void) semaphore_unlock(&(catalog->sema));
 		return false;
@@ -2014,8 +2014,8 @@ ld_store_insert_pgoutput_message(DatabaseCatalog *catalog,
 	 *    from ld_store_insert_pgoutput_message; a called function cannot
 	 *    return on behalf of its caller.
 	 *
-	 * 2. Implicit capture: the macro uses db, catalog, semaphore_unlock,
-	 *    and output_id — all local to this function.  Threading all of them
+	 * 2. Implicit capture: the macro uses catalog, col_sql, semaphore_unlock,
+	 *    and output_id: all local to this function.  Threading all of them
 	 *    through a function signature would obscure the logic with boilerplate.
 	 *
 	 * It is #undef'd immediately after its two call sites.
@@ -2028,7 +2028,7 @@ ld_store_insert_pgoutput_message(DatabaseCatalog *catalog,
 			PgoutputColumn *_c = &(cols_arr)[_i]; \
 			char _st[2] = { _c->status, '\0' }; \
 			SQLiteQuery _cq = { 0 }; \
-			if (!catalog_sql_prepare(db, col_sql, &_cq)) \
+			if (!catalog_sql_prepare_cached(catalog, col_sql, &_cq)) \
 			{ \
 				(void) semaphore_unlock(&(catalog->sema)); \
 				return false; \
