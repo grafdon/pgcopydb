@@ -528,7 +528,13 @@ The following options are available to ``pgcopydb follow``:
 
   The sentinel of the work directory stays the place to control and watch the run.
   The supervisor copies its endpos and apply settings to every worker, and ``pgcopydb stream sentinel get`` reports the lowest write, flush and replay LSN of all workers.
+  The replay LSN reaches endpos there only once the command is done, see :ref:`wal_workers_endpos` for the one case where it stays below.
   The command finishes when every worker has reached endpos.
+  Every worker stops before the first transaction that commits past endpos, so a transaction that changes the tables of several workers is applied by all of them or by none.
+  A worker that reached endpos moves its replication slot and origin to endpos, so after a clean finish every origin equals endpos, also for a worker whose tables saw no change.
+  When endpos falls inside the COMMIT record of a transaction, the slot and origin of a worker that gets that transaction stay where that record starts, so the transaction still arrives when endpos is raised.
+  When endpos moves after a worker finished, that worker starts again, and the command fails when endpos is set below what a worker already applied.
+  A worker also fails when it receives changes of a table assigned to another worker or to none, such as a partition created during the run, and the command fails when a publication of a worker is missing or publishes other tables, see :ref:`wal_workers_endpos`.
   When a worker fails, or a signal asks the supervisor to stop, the supervisor stops the other workers and the command exits with an error.
   A worker also stops when its supervisor exits, and on Linux its receive and apply processes stop when it exits.
   ``pgcopydb stream cleanup`` drops the slots, publications and origins of every worker.

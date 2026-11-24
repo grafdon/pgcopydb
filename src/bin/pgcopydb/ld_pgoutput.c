@@ -155,6 +155,89 @@ pgout_cstr(const char *buf, int *pos, int bufLen)
  * ----------
  */
 
+typedef struct WalWorkerLookup
+{
+	uint32_t oid;
+	WalWorkerTable table;
+	bool found;
+} WalWorkerLookup;
+
+
+static bool
+pgoutput_find_wal_worker_table(void *context, WalWorkerTable *table)
+{
+	WalWorkerLookup *lookup = (WalWorkerLookup *) context;
+
+	if (table->oid == lookup->oid)
+	{
+		lookup->table = *table;
+		lookup->found = true;
+	}
+
+	return true;
+}
+
+
+/*
+ * pgoutput_check_wal_worker stops a WAL worker that receives a table assigned
+ * to another worker, such as an attached partition: two workers would apply
+ * its changes, and the endpos cut of one would not hold for the other.
+ */
+static bool
+pgoutput_check_wal_worker(StreamContext *privateContext, uint32_t relOid,
+						  const char *nspname, const char *relname)
+{
+	StreamSpecs *specs = privateContext->specs;
+	DatabaseCatalog *sourceDB = privateContext->sourceDB;
+	WalWorkerLookup lookup = { .oid = relOid };
+
+	if (specs == NULL || !specs->walWorker)
+	{
+		return true;
+	}
+
+	if (!semaphore_lock(&(sourceDB->sema)))
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	bool success = catalog_iter_wal_worker_table(sourceDB, &lookup,
+												 &pgoutput_find_wal_worker_table);
+
+	(void) semaphore_unlock(&(sourceDB->sema));
+
+	if (!success)
+	{
+		/* errors have already been logged */
+		return false;
+	}
+
+	if (lookup.found && lookup.table.worker == specs->walWorkerIndex)
+	{
+		return true;
+	}
+
+	privateContext->fatal = true;
+
+	if (lookup.found)
+	{
+		log_fatal("WAL worker %d receives changes of table %s.%s (oid %u), "
+				  "which is assigned to WAL worker %d",
+				  specs->walWorkerIndex, nspname, relname, relOid,
+				  lookup.table.worker);
+	}
+	else
+	{
+		log_fatal("WAL worker %d receives changes of table %s.%s (oid %u), "
+				  "which is assigned to no WAL worker",
+				  specs->walWorkerIndex, nspname, relname, relOid);
+	}
+
+	return false;
+}
+
+
 /*
  * pgoutput_cache_relation parses a RELATION ('R') message starting at *pos
  * and inserts/updates the relation in ctx->pgoutputRelationCache.
@@ -183,6 +266,12 @@ pgoutput_cache_relation(StreamContext *privateContext,
 	const char *relname = pgout_cstr(buf, &pos, bufLen);
 	if (relname == NULL)
 	{
+		return false;
+	}
+
+	if (!pgoutput_check_wal_worker(privateContext, relOid, nspname, relname))
+	{
+		/* errors have already been logged */
 		return false;
 	}
 
@@ -394,7 +483,7 @@ parsePgoutputMessageActionAndXid(LogicalStreamContext *context)
 				log_error("pgoutput: BEGIN message too short (%d bytes)", bufLen);
 				return false;
 			}
-			pgout_u64(buf, &pos, bufLen);   /* final_lsn */
+			privateContext->beginFinalLSN = pgout_u64(buf, &pos, bufLen);
 			pgout_u64(buf, &pos, bufLen);   /* commit_time */
 			uint32_t xid = pgout_u32(buf, &pos, bufLen);
 

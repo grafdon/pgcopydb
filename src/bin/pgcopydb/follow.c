@@ -404,6 +404,16 @@ follow_main_loop(CopyDataSpec *copySpecs, StreamSpecs *streamSpecs)
 		 */
 		if (streamSpecs->sentinel.endpos != InvalidXLogRecPtr)
 		{
+			/* the supervisor starts a WAL worker again, or fails the run */
+			if (streamSpecs->walWorker)
+			{
+				log_info("WAL worker stopped short of endpos %X/%X "
+						 "with replay_lsn %X/%X",
+						 LSN_FORMAT_ARGS(streamSpecs->sentinel.endpos),
+						 LSN_FORMAT_ARGS(streamSpecs->sentinel.replay_lsn));
+				return true;
+			}
+
 			if (streamSpecs->sentinel.endpos <= streamSpecs->sentinel.replay_lsn)
 			{
 				log_info("Subprocesses exited with endpos reached at %X/%X "
@@ -451,6 +461,9 @@ follow_main_loop(CopyDataSpec *copySpecs, StreamSpecs *streamSpecs)
  *   apply exits cleanly without advancing replay_lsn past endpos, so check (a)
  *   does not fire.  apply also marks run_state='done' when a signal stopped
  *   it, so check (b) alone does not prove that apply reached endpos.
+ *
+ * A WAL worker uses check (b) only: its apply records 'done' only at endpos,
+ * once its origin and slot are there, and never after a signal.
  */
 bool
 follow_reached_endpos(StreamSpecs *streamSpecs, bool *done)
@@ -464,8 +477,9 @@ follow_reached_endpos(StreamSpecs *streamSpecs, bool *done)
 		return false;
 	}
 
-	/* Check (a): normal commit-boundary endpos */
-	if (sentinel->endpos != InvalidXLogRecPtr &&
+	/* Check (a): normal commit-boundary endpos, not proof for a WAL worker */
+	if (!streamSpecs->walWorker &&
+		sentinel->endpos != InvalidXLogRecPtr &&
 		sentinel->endpos <= sentinel->replay_lsn)
 	{
 		/* follow_get_sentinel logs replay_lsn and endpos already */
@@ -1576,7 +1590,8 @@ typedef struct FollowWalWorker
 	CDCPaths paths;
 	DatabaseCatalog catalog;
 	FollowSubProcess process;
-	bool done;
+	bool start;                 /* fork it in the next round */
+	uint64_t finishedAt;        /* endpos it last finished at, or 0 */
 } FollowWalWorker;
 
 
@@ -1832,6 +1847,88 @@ follow_set_wal_worker_publications(StreamSpecs *specs,
 }
 
 
+typedef struct WalWorkerOids
+{
+	int worker;
+	PQExpBuffer oids;
+} WalWorkerOids;
+
+
+static bool
+follow_add_wal_worker_oid(void *context, WalWorkerTable *table)
+{
+	WalWorkerOids *ctx = (WalWorkerOids *) context;
+
+	if (table->worker == ctx->worker)
+	{
+		appendPQExpBuffer(ctx->oids, "%s%u",
+						  ctx->oids->len > 1 ? "," : "",
+						  table->oid);
+	}
+
+	return true;
+}
+
+
+/*
+ * follow_check_wal_worker_publications fails unless the publications of a WAL
+ * worker exist and publish its tables only: Postgres 18 streams on without a
+ * dropped publication, and the changes of its table would be lost silently.
+ */
+static bool
+follow_check_wal_worker_publications(DatabaseCatalog *catalog,
+									 ConnStrings *connStrings,
+									 const char *slotName,
+									 int worker)
+{
+	WalWorkerOids ctx = { .worker = worker, .oids = createPQExpBuffer() };
+	char mismatch[BUFSIZE] = { 0 };
+	PGSQL src = { 0 };
+
+	if (ctx.oids == NULL)
+	{
+		log_error(ALLOCATION_FAILED_ERROR);
+		return false;
+	}
+
+	appendPQExpBufferChar(ctx.oids, '{');
+
+	bool success =
+		catalog_iter_wal_worker_table(catalog, &ctx,
+									  &follow_add_wal_worker_oid);
+
+	appendPQExpBufferChar(ctx.oids, '}');
+
+	success = success &&
+			  !PQExpBufferBroken(ctx.oids) &&
+			  pgsql_init(&src, connStrings->source_pguri, PGSQL_CONN_SOURCE) &&
+			  pgsql_wal_worker_publications_mismatch(&src, slotName,
+													 ctx.oids->data,
+													 mismatch,
+													 sizeof(mismatch));
+
+	(void) pgsql_finish(&src);
+	destroyPQExpBuffer(ctx.oids);
+
+	if (!success)
+	{
+		log_error("Failed to check the publications of WAL worker %d, "
+				  "see above for details",
+				  worker);
+		return false;
+	}
+
+	if (!IS_EMPTY_STRING_BUFFER(mismatch))
+	{
+		log_fatal("Failed to check the publications of WAL worker %d: %s",
+				  worker, mismatch);
+		return false;
+	}
+
+	return true;
+}
+
+
 /*
  * follow_run_wal_worker runs the existing follow loop in a forked WAL worker,
  * on the worker's own catalog, CDC directory, slot, origin and publications.
@@ -1851,6 +1948,9 @@ follow_run_wal_worker(CopyDataSpec *copySpecs,
 	/* SIGQUIT sets asked_to_quit, so receive and apply are stopped first */
 	(void) set_signal_handlers(false);
 	follow_quit_with_parent(supervisor);
+
+	/* a worker forked again keeps no copy of the supervisor's socket */
+	(void) follow_coordinator_shutdown(&followCoord);
 
 	copySpecs->catalogs.source = worker->catalog;
 	copySpecs->catalogs.output = (DatabaseCatalog) {
@@ -1884,7 +1984,11 @@ follow_run_wal_worker(CopyDataSpec *copySpecs,
 						   streamSpecs->targetDB) ||
 		!follow_set_wal_worker_publications(&specs,
 											streamSpecs->slot.slotName,
-											worker->index))
+											worker->index) ||
+		!follow_check_wal_worker_publications(specs.sourceDB,
+											  streamSpecs->connStrings,
+											  streamSpecs->slot.slotName,
+											  worker->index))
 	{
 		/* errors have already been logged */
 		exit(EXIT_CODE_INTERNAL_ERROR);
@@ -1893,6 +1997,7 @@ follow_run_wal_worker(CopyDataSpec *copySpecs,
 	specs.maxReplayDBSize = streamSpecs->maxReplayDBSize;
 	specs.walWorkers = 1;
 	specs.walWorker = true;
+	specs.walWorkerIndex = worker->index;
 	specs.walSupervisor = supervisor;
 
 	if (!follow_main_loop(copySpecs, &specs))
@@ -1936,6 +2041,9 @@ follow_start_wal_worker(CopyDataSpec *copySpecs,
 		default:
 		{
 			worker->process.pid = fpid;
+			worker->process.exited = false;
+			worker->process.returnCode = 0;
+			worker->process.sig = 0;
 
 			log_info("Started WAL worker %d with pid %d, "
 					 "replication slot \"%s\" and origin \"%s\"",
@@ -1998,11 +2106,13 @@ follow_sync_wal_workers(FollowWalWorker *workers, int count,
 
 /*
  * follow_sync_main_sentinel writes the lowest write, flush and replay LSN of
- * the workers to the main sentinel, the one that commands and humans read.
+ * the workers to the main sentinel, the one that commands and humans read. A
+ * replay_lsn at endpos tells a resume the run is done, so it waits for done.
  */
 static bool
 follow_sync_main_sentinel(DatabaseCatalog *sourceDB,
 						  FollowWalWorker *workers, int count,
+						  uint64_t endpos, bool done,
 						  uint64_t *replayLSN)
 {
 	CopyDBSentinel low = { 0 };
@@ -2035,6 +2145,12 @@ follow_sync_main_sentinel(DatabaseCatalog *sourceDB,
 
 	*replayLSN = low.replay_lsn;
 
+	if (!done && endpos != InvalidXLogRecPtr && endpos <= low.replay_lsn)
+	{
+		return sentinel_update_write_flush_lsn(sourceDB, low.write_lsn,
+											   low.flush_lsn);
+	}
+
 	return sentinel_update_write_flush_lsn(sourceDB, low.write_lsn,
 										   low.flush_lsn) &&
 		   sentinel_update_replay_lsn(sourceDB, low.replay_lsn);
@@ -2042,30 +2158,112 @@ follow_sync_main_sentinel(DatabaseCatalog *sourceDB,
 
 
 /*
- * follow_wal_worker_reached_endpos runs follow_reached_endpos on the catalog
- * of a WAL worker. shortcut: each worker is judged by the endpos it last read,
- * a raised endpos restarts no finished worker; tighten with the endpos cut.
+ * follow_check_wal_workers_endpos fails when endpos is below the replay_lsn of
+ * a WAL worker: the target cannot un-apply what that worker committed.
  */
 static bool
-follow_wal_worker_reached_endpos(StreamSpecs *streamSpecs,
-								 FollowWalWorker *worker)
+follow_check_wal_workers_endpos(FollowWalWorker *workers, int count,
+								uint64_t endpos)
 {
-	StreamSpecs specs = *streamSpecs;
+	if (endpos == InvalidXLogRecPtr)
+	{
+		return true;
+	}
 
-	specs.sourceDB = &(worker->catalog);
-	worker->done = false;
+	for (int k = 0; k < count; k++)
+	{
+		CopyDBSentinel sentinel = { 0 };
 
-	return follow_reached_endpos(&specs, &(worker->done));
+		if (!sentinel_get(&(workers[k].catalog), &sentinel))
+		{
+			log_error("Failed to read the sentinel of WAL worker %d", k);
+			return false;
+		}
+
+		if (endpos < sentinel.replay_lsn)
+		{
+			log_fatal("Failed to stop at endpos %X/%X: WAL worker %d has "
+					  "already applied changes up to replay_lsn %X/%X, "
+					  "which the target cannot un-apply",
+					  LSN_FORMAT_ARGS(endpos),
+					  k,
+					  LSN_FORMAT_ARGS(sentinel.replay_lsn));
+			return false;
+		}
+	}
+
+	return true;
 }
 
 
 /*
- * follow_wal_worker_exited returns false when a WAL worker failed, or exited
- * before reaching endpos, which is expected only once stopping.
+ * follow_fork_wal_workers forks the WAL workers marked to start, with their
+ * apply marked as not finished yet and no SQLite handle open across fork().
  */
 static bool
-follow_wal_worker_exited(StreamSpecs *streamSpecs,
-						 FollowWalWorker *worker,
+follow_fork_wal_workers(CopyDataSpec *copySpecs, StreamSpecs *streamSpecs,
+						FollowWalWorker *workers, int count, int *running)
+{
+	bool success = true;
+
+	for (int k = 0; success && k < count; k++)
+	{
+		if (workers[k].start)
+		{
+			workers[k].finishedAt = InvalidXLogRecPtr;
+			success =
+				pipeline_state_start(&(workers[k].catalog), "receive",
+									 InvalidXLogRecPtr) &&
+				pipeline_state_start(&(workers[k].catalog), "apply",
+									 InvalidXLogRecPtr);
+		}
+	}
+
+	success = success &&
+			  catalog_close_from_specs(copySpecs) &&
+			  catalog_close(&(copySpecs->catalogs.output)) &&
+			  catalog_close(&(copySpecs->catalogs.replay));
+
+	for (int k = 0; success && k < count; k++)
+	{
+		success = catalog_close(&(workers[k].catalog));
+	}
+
+	if (!success)
+	{
+		log_error("Failed to prepare the WAL workers for fork()");
+		return false;
+	}
+
+	for (int k = 0; success && k < count; k++)
+	{
+		if (workers[k].start)
+		{
+			workers[k].start = false;
+			success = follow_start_wal_worker(copySpecs, streamSpecs,
+											  &(workers[k]));
+			*running += success ? 1 : 0;
+		}
+	}
+
+	bool reopened = catalog_open(streamSpecs->sourceDB);
+
+	for (int k = 0; reopened && k < count; k++)
+	{
+		reopened = catalog_open(&(workers[k].catalog));
+	}
+
+	return success && reopened;
+}
+
+
+/*
+ * follow_wal_worker_exited records the endpos at which a WAL worker finished,
+ * or marks it to start again when its receive signalled done below endpos, or
+ * not at all. It returns false when the worker failed or stopped short.
+ */
+static bool
+follow_wal_worker_exited(FollowWalWorker *worker, uint64_t endpos,
 						 bool stopping)
 {
 	FollowSubProcess *process = &(worker->process);
@@ -2081,24 +2279,47 @@ follow_wal_worker_exited(StreamSpecs *streamSpecs,
 		return false;
 	}
 
-	if (!follow_wal_worker_reached_endpos(streamSpecs, worker))
+	PipelineStateEntry apply = { 0 };
+	PipelineStateEntry receive = { 0 };
+
+	if (!pipeline_state_get(&(worker->catalog), "apply", &apply) ||
+		!pipeline_state_get(&(worker->catalog), "receive", &receive))
 	{
-		/* errors have already been logged */
+		log_error("Failed to read the state of WAL worker %d", worker->index);
 		return false;
 	}
 
-	if (!worker->done)
+	/* the apply of a WAL worker records done only at endpos */
+	if (streq(apply.run_state, "done") &&
+		apply.run_end_lsn != InvalidXLogRecPtr)
 	{
-		log_level(logLevel,
-				  "WAL worker %d with pid %d has exited before reaching endpos",
-				  worker->index, process->pid);
-		return false;
+		worker->finishedAt = apply.run_end_lsn;
+
+		log_info("WAL worker %d with pid %d has reached endpos %X/%X",
+				 worker->index, process->pid,
+				 LSN_FORMAT_ARGS(worker->finishedAt));
+		return true;
 	}
 
-	log_info("WAL worker %d with pid %d has reached endpos",
-			 worker->index, process->pid);
+	if (!stopping &&
+		endpos != InvalidXLogRecPtr &&
+		streq(receive.run_state, "done") &&
+		receive.run_end_lsn < endpos)
+	{
+		log_info("WAL worker %d with pid %d stopped below endpos %X/%X: "
+				 "its receive signalled done at %X/%X",
+				 worker->index, process->pid,
+				 LSN_FORMAT_ARGS(endpos),
+				 LSN_FORMAT_ARGS(receive.run_end_lsn));
+		worker->start = true;
+		return true;
+	}
 
-	return true;
+	log_level(logLevel,
+			  "WAL worker %d with pid %d has exited before reaching endpos",
+			  worker->index, process->pid);
+
+	return false;
 }
 
 
@@ -2142,6 +2363,8 @@ follow_supervise_workers(CopyDataSpec *copySpecs, StreamSpecs *streamSpecs)
 					  k);
 			return false;
 		}
+
+		workers[k].start = true;
 	}
 
 	if (!sentinel_get(sourceDB, &sentinel) ||
@@ -2152,38 +2375,10 @@ follow_supervise_workers(CopyDataSpec *copySpecs, StreamSpecs *streamSpecs)
 		return false;
 	}
 
-	/* SQLite connections must not cross fork() */
-	bool closed =
-		catalog_close_from_specs(copySpecs) &&
-		catalog_close(&(copySpecs->catalogs.output)) &&
-		catalog_close(&(copySpecs->catalogs.replay));
-
-	for (int k = 0; closed && k < count; k++)
-	{
-		closed = catalog_close(&(workers[k].catalog));
-	}
-
-	if (!closed)
-	{
-		log_error("Failed to close catalog connections before forking");
-		return false;
-	}
-
-	bool failed = false;
 	int running = 0;
-
-	for (int k = 0; !failed && k < count; k++)
-	{
-		failed = !follow_start_wal_worker(copySpecs, streamSpecs, &(workers[k]));
-		running += failed ? 0 : 1;
-	}
-
-	bool reopened = catalog_open(sourceDB);
-
-	for (int k = 0; reopened && k < count; k++)
-	{
-		reopened = catalog_open(&(workers[k].catalog));
-	}
+	bool failed =
+		!follow_fork_wal_workers(copySpecs, streamSpecs, workers, count,
+								 &running);
 
 	const char *coordHost =
 		IS_EMPTY_STRING_BUFFER(streamSpecs->coordHost)
@@ -2191,7 +2386,6 @@ follow_supervise_workers(CopyDataSpec *copySpecs, StreamSpecs *streamSpecs)
 		: streamSpecs->coordHost;
 
 	failed = failed ||
-			 !reopened ||
 			 !follow_coordinator_init(&followCoord, coordHost,
 									  streamSpecs->coordPort);
 
@@ -2207,7 +2401,7 @@ follow_supervise_workers(CopyDataSpec *copySpecs, StreamSpecs *streamSpecs)
 	uint64_t replayLSN = sentinel.replay_lsn;
 	time_t lastSync = 0;
 
-	while (running > 0)
+	for (;;)
 	{
 		if (!stopping && (asked_to_stop || asked_to_stop_fast || asked_to_quit))
 		{
@@ -2215,6 +2409,22 @@ follow_supervise_workers(CopyDataSpec *copySpecs, StreamSpecs *streamSpecs)
 					 "stopping %d WAL workers",
 					 running);
 			(void) follow_stop_wal_workers(workers, count, &stopping);
+		}
+
+		bool synced = sentinel_get(sourceDB, &sentinel);
+
+		if (synced && (sentinel.endpos != endpos || sentinel.apply != apply))
+		{
+			synced = follow_sync_wal_workers(workers, count, &sentinel);
+			endpos = sentinel.endpos;
+			apply = sentinel.apply;
+
+			if (synced && !follow_check_wal_workers_endpos(workers, count,
+														   endpos))
+			{
+				failed = true;
+				(void) follow_stop_wal_workers(workers, count, &stopping);
+			}
 		}
 
 		for (int k = 0; k < count; k++)
@@ -2245,27 +2455,25 @@ follow_supervise_workers(CopyDataSpec *copySpecs, StreamSpecs *streamSpecs)
 
 			--running;
 
-			if (!follow_wal_worker_exited(streamSpecs, &(workers[k]), stopping))
+			if (!follow_wal_worker_exited(&(workers[k]), endpos, stopping))
 			{
 				failed = failed || !stopping;
 				(void) follow_stop_wal_workers(workers, count, &stopping);
 			}
 		}
 
-		bool synced = sentinel_get(sourceDB, &sentinel);
-
-		if (synced && (sentinel.endpos != endpos || sentinel.apply != apply))
-		{
-			synced = follow_sync_wal_workers(workers, count, &sentinel);
-			endpos = sentinel.endpos;
-			apply = sentinel.apply;
-		}
-
 		if (synced && time(NULL) != lastSync)
 		{
 			lastSync = time(NULL);
 			synced = follow_sync_main_sentinel(sourceDB, workers, count,
-											   &replayLSN);
+											   endpos, false, &replayLSN);
+
+			if (synced && !follow_check_wal_workers_endpos(workers, count,
+														   endpos))
+			{
+				failed = true;
+				(void) follow_stop_wal_workers(workers, count, &stopping);
+			}
 		}
 
 		if (!synced && !failed)
@@ -2274,6 +2482,63 @@ follow_supervise_workers(CopyDataSpec *copySpecs, StreamSpecs *streamSpecs)
 					  "see above for details");
 			failed = true;
 			(void) follow_stop_wal_workers(workers, count, &stopping);
+		}
+
+		/* endpos is re-read after the last exit: it may have been raised */
+		if (running == 0 && !stopping && !failed)
+		{
+			CopyDBSentinel last = { 0 };
+
+			if (!sentinel_get(sourceDB, &last))
+			{
+				log_error("Failed to read the main sentinel");
+				failed = true;
+				break;
+			}
+
+			if (last.endpos != endpos)
+			{
+				continue;
+			}
+		}
+
+		/*
+		 * An endpos moved since a worker finished starts it again; one below
+		 * its replay_lsn failed the run above.
+		 */
+		bool again = false;
+
+		for (int k = 0; !stopping && !failed && k < count; k++)
+		{
+			FollowWalWorker *worker = &(workers[k]);
+
+			if (worker->process.exited &&
+				endpos != InvalidXLogRecPtr &&
+				worker->finishedAt != InvalidXLogRecPtr &&
+				worker->finishedAt != endpos)
+			{
+				log_info("Starting WAL worker %d again: it finished at %X/%X, "
+						 "endpos is now %X/%X",
+						 k,
+						 LSN_FORMAT_ARGS(worker->finishedAt),
+						 LSN_FORMAT_ARGS(endpos));
+				worker->start = true;
+			}
+
+			again = again || worker->start;
+		}
+
+		if (again &&
+			!follow_fork_wal_workers(copySpecs, streamSpecs, workers, count,
+									 &running))
+		{
+			failed = true;
+			(void) follow_stop_wal_workers(workers, count, &stopping);
+		}
+
+		if (running == 0)
+		{
+			break;
 		}
 
 		(void) follow_coordinator_handle_messages(&followCoord, streamSpecs);
@@ -2285,16 +2550,27 @@ follow_supervise_workers(CopyDataSpec *copySpecs, StreamSpecs *streamSpecs)
 		}
 	}
 
-	/* a signal can make a worker record apply 'done' short of endpos */
+	/* a signal stops the workers short of endpos, whatever they recorded */
 	bool stopped = asked_to_stop || asked_to_stop_fast || asked_to_quit;
-	bool allDone = !failed && !stopped &&
-				   follow_sync_main_sentinel(sourceDB, workers, count,
-											 &replayLSN);
+	bool allDone = !failed && !stopped && endpos != InvalidXLogRecPtr;
 
 	for (int k = 0; k < count; k++)
 	{
-		allDone = allDone && workers[k].done;
+		allDone = allDone && workers[k].finishedAt == endpos;
 	}
+
+	/* a publication dropped meanwhile lost the changes of its table */
+	for (int k = 0; allDone && k < count; k++)
+	{
+		allDone = follow_check_wal_worker_publications(sourceDB,
+													   streamSpecs->connStrings,
+													   streamSpecs->slot.slotName,
+													   k);
+	}
+
+	allDone = allDone &&
+			  follow_sync_main_sentinel(sourceDB, workers, count, endpos, true,
+										&replayLSN);
 
 	(void) pipeline_state_end(sourceDB, "apply", replayLSN, allDone);
 	(void) follow_coordinator_shutdown(&followCoord);

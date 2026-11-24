@@ -229,9 +229,10 @@ It fires when the last durable applied commit covers endpos.
 
 **b.** ``pipeline_state["apply"].run_state = 'done'`` with ``sentinel.endpos != 0`` is the secondary check.
 It covers a clean drain when endpos falls between or inside transactions without an applied COMMIT at endpos.
-Apply marks itself ``'done'`` only after a successful, intentional exit; interrupted work is not a successful drain.
+Apply also marks itself ``'done'`` when a signal stopped it, so (b) alone does not prove a drain.
 
 ``follow_reached_endpos`` checks (a) first; if (a) misses, it checks (b).
+A WAL worker uses (b) only, because its apply marks itself ``'done'`` at endpos only, see :ref:`wal_workers_endpos`.
 
 Transform exit for mid-transaction endpos
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -295,6 +296,53 @@ Transactions already acknowledged during prefetch remain available in that spool
 The BEGIN cursor uses ``>=`` so it includes a next transaction beginning exactly at the previous COMMIT LSN.
 An incomplete transaction can be completed by redelivery without advancing the apply cursor past its missing COMMIT.
 
+.. _wal_workers_endpos:
+
+One endpos for several WAL workers
+----------------------------------
+
+With ``--wal-workers`` above 1, each WAL worker decodes its own replication slot, and pgoutput sends a transaction to a worker only when the transaction changes a table of that worker.
+The BEGIN of that stream is at the first change the worker gets, so one source transaction has a different BEGIN position in each stream.
+Its commit LSN, the end of its COMMIT record, is the same in every stream.
+
+A WAL worker therefore stops before any transaction that commits past endpos: Guard 2 compares endpos with the commit LSN, and the mid-transaction case, which applies the whole transaction, never happens.
+We cut on the commit LSN because the BEGIN rule lets one worker apply its part of a transaction that spans two workers, while the other worker stops before its part.
+Once receive knows endpos it spools nothing past it, but an endpos set later can leave transactions that commit past it in a spool, so apply stops before those too.
+
+A WAL worker that stopped at endpos moves its replication slot on the source and its replication origin on the target to endpos.
+After a clean finish every origin equals endpos, also for a worker whose tables saw no change, unless endpos falls inside a COMMIT record, see below.
+The worker moves them only when all of the following hold in the same run:
+
+1. receive signalled over the lifecycle pipe that it is done at endpos, which it never does after a signal;
+2. the spool holds no complete transaction committing at or below endpos that apply did not apply;
+3. no signal asked the worker to stop.
+
+Apply then waits until the walsender of receive releases the slot and calls ``pg_replication_slot_advance()``, then commits an empty transaction with ``pg_replication_origin_xact_setup()`` at endpos on its own session and records the slot position as its ``replay_lsn``.
+Apply sends that commit as one simple query, as it does for a group of applied transactions, and reads its result before it goes on: a target session lost meanwhile fails the worker instead of marking it done.
+We move the slot first, so that a stop or an error between the two steps leaves the origin behind, and the next run moves both again.
+Only then does apply mark itself ``'done'`` at endpos; a stop by a signal, an error, or a missing condition marks it ``'error'``.
+A resume that finds the origin already at endpos goes through the same steps, so it also moves a slot that an interrupted run left below endpos.
+
+Endpos can fall inside the COMMIT record of a transaction, as a hand-typed LSN or a flush position at a page boundary can.
+That transaction commits past endpos, and receive drops its COMMIT, but the walsender decides to skip a transaction by where its COMMIT record starts.
+A slot confirmed at endpos would skip it for good when endpos is raised later.
+Receive therefore reads the start of the COMMIT record from the BEGIN message of the open transaction and sends it to apply as a second LSN on the lifecycle pipe.
+Apply moves the slot, the origin and ``replay_lsn`` only up to that LSN, and still marks itself ``'done'`` at endpos.
+The origin stays there too, because a later run starts its ``replay_lsn`` from the origin, and receive confirms ``replay_lsn`` to the slot.
+
+The supervisor records the endpos each worker finished at, and reads endpos again from the sentinel of the work directory after the last worker exited.
+The run is done when every worker finished at that endpos.
+Only then does the supervisor write the lowest ``replay_lsn`` of the workers to the work directory, because a resume that reads a ``replay_lsn`` at endpos stops at once as finished.
+When endpos moved after a worker finished, or when its receive signalled done below endpos or not at all, the supervisor starts that worker again on its own catalog, slot and origin.
+Receive signals nothing when a signal stopped it short of endpos, or when endpos moved past its stop record during its last flush; apply then stops waiting once receive recorded that it is done.
+When endpos is set below the ``replay_lsn`` of a worker, the run fails, because the target cannot un-apply changes past endpos.
+
+Two guards stop a run that would otherwise duplicate or lose changes:
+
+- Receive fails on a RELATION message for a table that the assignment gives to another worker or to none, as when a table of one worker is attached as a partition of a partitioned table of another worker.
+- Each worker at start, and the supervisor before it reports done, checks that the publications of each worker exist and publish its tables and no other.
+  Postgres 18 skips a dropped publication with a warning and streams on, which would lose the changes of its table without an error.
+
 .. _pipe_protocol:
 
 The receive→apply lifecycle pipe
@@ -334,6 +382,7 @@ pgcopydb layers the final-LSN payload on top of that bare death-watch so that
 than merely learning *that* the upstream is gone.
 Receive stops at the first record past endpos without writing it, and then the
 payload is endpos itself.
+A WAL worker adds a second LSN in the same write: how far its slot may be confirmed, see :ref:`wal_workers_endpos`.
 Before it stops, receive reads endpos from the sentinel again, and when endpos
 has moved to or past that record it streams on.
 
@@ -373,3 +422,5 @@ Invariant summary
      - target Postgres COMMIT confirmed
      - mid-txn or between-txn endpos
      - apply replay cursor; origin restart
+
+A WAL worker sets its slot, ``context->previousLSN``, its origin and ``sentinel.replay_lsn`` at endpos only once the conditions in :ref:`wal_workers_endpos` hold, or all four at the start of a COMMIT record that endpos falls inside.

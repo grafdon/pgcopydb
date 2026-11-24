@@ -5853,6 +5853,148 @@ pgsql_check_wal_worker_slot(PGSQL *pgsql, const char *slotName, uint64_t lsn)
 
 
 /*
+ * pgsql_replication_slot_inactive_lsn sets lsn to the confirmed flush LSN of
+ * the slot, or to InvalidXLogRecPtr while a walsender uses the slot.
+ */
+bool
+pgsql_replication_slot_inactive_lsn(PGSQL *pgsql, const char *slotName,
+									uint64_t *lsn)
+{
+	SingleValueResultContext context = { { 0 }, PGSQL_RESULT_STRING, false };
+
+	char *sql =
+		"select case when active then '0/0' else confirmed_flush_lsn::text end "
+		"  from pg_replication_slots where slot_name = $1";
+	Oid paramTypes[1] = { NAMEOID };
+	const char *paramValues[1] = { slotName };
+
+	if (!pgsql_execute_with_params(pgsql, sql, 1, paramTypes, paramValues,
+								   &context, &parseSingleValueResult))
+	{
+		log_error("Failed to check replication slot \"%s\"", slotName);
+		return false;
+	}
+
+	if (context.ntuples == 0)
+	{
+		log_error("Replication slot \"%s\" does not exist", slotName);
+		return false;
+	}
+
+	if (!context.parsedOk || context.isNull || !parseLSN(context.strVal, lsn))
+	{
+		log_error("Failed to parse the LSN of replication slot \"%s\"",
+				  slotName);
+		return false;
+	}
+
+	return true;
+}
+
+
+/*
+ * pgsql_replication_slot_advance calls pg_replication_slot_advance(), which
+ * moves no further than the flushed WAL, and returns where the slot is.
+ */
+bool
+pgsql_replication_slot_advance(PGSQL *pgsql, const char *slotName,
+							   uint64_t lsn, uint64_t *endLSN)
+{
+	SingleValueResultContext context = { { 0 }, PGSQL_RESULT_STRING, false };
+	char lsnString[PG_LSN_MAXLENGTH] = { 0 };
+
+	sformat(lsnString, sizeof(lsnString), "%X/%X", LSN_FORMAT_ARGS(lsn));
+
+	char *sql = "select end_lsn from pg_replication_slot_advance($1, $2)";
+	Oid paramTypes[2] = { NAMEOID, LSNOID };
+	const char *paramValues[2] = { slotName, lsnString };
+
+	if (!pgsql_execute_with_params(pgsql, sql, 2, paramTypes, paramValues,
+								   &context, &parseSingleValueResult))
+	{
+		log_error("Failed to advance replication slot \"%s\" to %s",
+				  slotName, lsnString);
+		return false;
+	}
+
+	if (!context.parsedOk || context.isNull || !parseLSN(context.strVal, endLSN))
+	{
+		log_error("Failed to parse the LSN of replication slot \"%s\"",
+				  slotName);
+		return false;
+	}
+
+	return true;
+}
+
+
+/*
+ * pgsql_wal_worker_publications_mismatch describes in mismatch the first way
+ * the publications <slotName>_t<oid> of the given oids differ from those
+ * tables, or leaves it empty. A partitioned table publishes its leaves only.
+ */
+bool
+pgsql_wal_worker_publications_mismatch(PGSQL *pgsql, const char *slotName,
+									   const char *oids, char *mismatch,
+									   size_t size)
+{
+	SingleValueResultContext context = { { 0 }, PGSQL_RESULT_STRING, false };
+
+	char *sql =
+		"with a as ("
+		"  select o.oid, $1 || '_t' || o.oid as pubname, c.relkind"
+		"    from unnest($2::oid[]) as o(oid)"
+		"         left join pg_class c on c.oid = o.oid"
+		"), "
+		"got as ("
+		"  select t.pubname, c.oid,"
+		"         format('%I.%I', t.schemaname, t.tablename) as qname"
+		"    from pg_publication_tables t"
+		"         left join pg_namespace n on n.nspname = t.schemaname"
+		"         left join pg_class c"
+		"                on c.relnamespace = n.oid and c.relname = t.tablename"
+		"   where t.pubname in (select pubname from a)"
+		") "
+		"select coalesce("
+		"  (select format('publication \"%s\" does not exist', a.pubname)"
+		"     from a"
+		"    where not exists"
+		"          (select 1 from pg_publication p where p.pubname = a.pubname)"
+		" order by a.oid limit 1),"
+		"  (select format('table with oid %s does not exist', a.oid)"
+		"     from a where a.relkind is null order by a.oid limit 1),"
+		"  (select format('publication \"%s\" publishes table %s, "
+		"which is not assigned to this worker', got.pubname, got.qname)"
+		"     from got"
+		"    where got.oid is null or got.oid not in (select oid from a)"
+		" order by got.pubname, got.qname limit 1),"
+		"  (select format('table %s is in no publication', a.oid::regclass)"
+		"     from a"
+		"    where a.relkind <> 'p'"
+		"      and a.oid not in (select oid from got where oid is not null)"
+		" order by a.oid limit 1),"
+		"  '')";
+
+	Oid paramTypes[2] = { TEXTOID, TEXTOID };
+	const char *paramValues[2] = { slotName, oids };
+
+	if (!pgsql_execute_with_params(pgsql, sql, 2, paramTypes, paramValues,
+								   &context, &parseSingleValueResult) ||
+		!context.parsedOk || context.isNull)
+	{
+		log_error("Failed to compare the publications \"%s_t<oid>\" "
+				  "with their tables",
+				  slotName);
+		return false;
+	}
+
+	strlcpy(mismatch, context.strVal, size);
+
+	return true;
+}
+
+
+/*
  * pgsql_drop_wal_worker_slots drops the slots named <slotName>_w<digits>.
  * pg_drop_replication_slot fails on a slot in use instead of waiting.
  */

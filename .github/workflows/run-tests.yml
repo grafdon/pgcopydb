@@ -163,6 +163,7 @@ jobs:
           - cdc-endpos-before-txn
           - cdc-file-rotation-live
           - cdc-wal-workers
+          - cdc-wal-workers-endpos
           - wal-workers-assign
         exclude:
           # timescaledb uses timescale/timescaledb:latest-pg13 for both source
@@ -241,6 +242,8 @@ jobs:
           - TEST: cdc-file-rotation-live
             PGVERSION: 16
           - TEST: cdc-wal-workers
+            PGVERSION: 16
+          - TEST: cdc-wal-workers-endpos
             PGVERSION: 16
           - TEST: wal-workers-assign
             PGVERSION: 16

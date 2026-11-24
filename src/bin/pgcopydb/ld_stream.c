@@ -432,8 +432,9 @@ stream_check_in_out(StreamSpecs *specs)
 
 /*
  * stream_signal_upstream_done writes the 8-byte big-endian done-LSN to
- * pipe_write_fd then closes it.  This is the single out-of-band lifecycle
- * signal from receive→transform and from transform→apply.
+ * pipe_rt[1] then closes it.  This is the single out-of-band lifecycle
+ * signal from receive→transform and from transform→apply.  A WAL worker
+ * writes confirm_lsn after it, in the same write.
  *
  * Pattern inspired by PostgreSQL's postmaster_alive_fds: the write end is held
  * open by the upstream process and closed on exit.  Downstream uses select()
@@ -441,18 +442,22 @@ stream_check_in_out(StreamSpecs *specs)
  * We additionally write the final LSN so downstream can drain cleanly.
  */
 bool
-stream_signal_upstream_done(int pipe_write_fd, uint64_t done_lsn)
+stream_signal_upstream_done(StreamSpecs *specs, uint64_t done_lsn,
+							uint64_t confirm_lsn)
 {
+	int pipe_write_fd = specs->pipe_rt[1];
+
 	if (pipe_write_fd <= 0)
 	{
 		return true;  /* -1 = no pipe; 0 = stdin (not a write pipe) */
 	}
 
-	/* Network byte order: big-endian 64-bit LSN */
-	uint64_t wire = pg_hton64(done_lsn);
+	/* Network byte order: big-endian 64-bit LSNs */
+	uint64_t wire[2] = { pg_hton64(done_lsn), pg_hton64(confirm_lsn) };
+	ssize_t size = specs->walWorker ? sizeof(wire) : sizeof(wire[0]);
 
-	ssize_t n = write(pipe_write_fd, &wire, sizeof(wire));
-	if (n != sizeof(wire))
+	ssize_t n = write(pipe_write_fd, wire, size);
+	if (n != size)
 	{
 		/* EPIPE = downstream already gone; not fatal */
 		if (errno != EPIPE)
@@ -463,6 +468,8 @@ stream_signal_upstream_done(int pipe_write_fd, uint64_t done_lsn)
 	}
 
 	close(pipe_write_fd);
+	specs->pipe_rt[1] = -1;  /* prevent double-close */
+
 	return true;
 }
 
@@ -477,14 +484,16 @@ stream_signal_upstream_done(int pipe_write_fd, uint64_t done_lsn)
 bool
 stream_recv_upstream_done(StreamSpecs *specs, int pipe_read_fd)
 {
-	uint64_t wire = 0;
-	ssize_t n = read(pipe_read_fd, &wire, sizeof(wire));
+	uint64_t wire[2] = { 0 };
+	ssize_t size = specs->walWorker ? sizeof(wire) : sizeof(wire[0]);
+	ssize_t n = read(pipe_read_fd, wire, size);
 
 	specs->upstream_done = true;
 
-	if (n == (ssize_t) sizeof(wire))
+	if (n == size)
 	{
-		specs->upstream_done_lsn = pg_ntoh64(wire);
+		specs->upstream_done_lsn = pg_ntoh64(wire[0]);
+		specs->upstream_confirm_lsn = pg_ntoh64(wire[1]);
 		log_info("Upstream done signal received: final LSN %X/%X",
 				 LSN_FORMAT_ARGS(specs->upstream_done_lsn));
 	}
@@ -748,6 +757,12 @@ startLogicalStreaming(StreamSpecs *specs)
 			context.tracking->written_lsn = privateContext->committedWrittenLSN;
 		}
 
+		/* a reconnect would only meet the same error again */
+		if (privateContext->fatal)
+		{
+			return false;
+		}
+
 		if ((cleanExit && context.endpos != InvalidXLogRecPtr) ||
 			asked_to_stop || asked_to_stop_fast || asked_to_quit)
 		{
@@ -806,11 +821,17 @@ startLogicalStreaming(StreamSpecs *specs)
 	 * already sent from streamCloseFile; pipeline_state_end makes it durable
 	 * in the sentinel database for restart recovery.
 	 */
-	(void) pipeline_state_end(specs->sourceDB, "receive",
-							  privateContext->endpos != InvalidXLogRecPtr
-							  ? privateContext->endpos
-							  : context.tracking->written_lsn,
-							  true);
+	uint64_t endLSN = privateContext->endpos != InvalidXLogRecPtr
+					  ? privateContext->endpos
+					  : context.tracking->written_lsn;
+
+	/* a WAL worker records what it signalled, which a raised endpos is not */
+	if (specs->walWorker)
+	{
+		endLSN = privateContext->doneLSN;
+	}
+
+	(void) pipeline_state_end(specs->sourceDB, "receive", endLSN, true);
 	return true;
 }
 
@@ -1332,7 +1353,36 @@ streamCloseFile(LogicalStreamContext *context, bool time_to_abort)
 		(privateContext->endpos <= context->cur_record_lsn ||
 		 privateContext->endpos < context->stopRecordLSN))
 	{
+		StreamSpecs *specs = privateContext->specs;
 		uint64_t done_lsn = Max(context->cur_record_lsn, privateContext->endpos);
+		uint64_t confirm_lsn = InvalidXLogRecPtr;
+
+		/* a WAL worker advances to this LSN: its endpos, or none after a signal */
+		if (specs != NULL && specs->walWorker)
+		{
+			done_lsn =
+				asked_to_stop || asked_to_stop_fast || asked_to_quit
+				? InvalidXLogRecPtr
+				: privateContext->endpos;
+			confirm_lsn = done_lsn;
+			privateContext->doneLSN = done_lsn;
+
+			/* a slot confirmed past where a COMMIT record starts skips it */
+			if (privateContext->transactionInProgress &&
+				privateContext->beginFinalLSN < confirm_lsn)
+			{
+				confirm_lsn = privateContext->beginFinalLSN;
+
+				log_info("Endpos %X/%X lies inside the COMMIT record of xid %u "
+						 "at %X/%X: replication slot \"%s\" and origin \"%s\" "
+						 "move no further",
+						 LSN_FORMAT_ARGS(done_lsn),
+						 privateContext->currentXid,
+						 LSN_FORMAT_ARGS(confirm_lsn),
+						 specs->slot.slotName,
+						 specs->origin);
+			}
+		}
 
 		log_info("streamCloseFile: receive done at %X/%X, signalling transform",
 				 LSN_FORMAT_ARGS(done_lsn));
@@ -1344,12 +1394,9 @@ streamCloseFile(LogicalStreamContext *context, bool time_to_abort)
 		 * to that point before exiting.  This replaces the old in-band
 		 * ENDPOS signal that used to be inserted into the SQLite output table.
 		 */
-		StreamSpecs *specs = privateContext->specs;
-
-		if (specs != NULL && specs->pipe_rt[1] > 0)
+		if (specs != NULL)
 		{
-			(void) stream_signal_upstream_done(specs->pipe_rt[1], done_lsn);
-			specs->pipe_rt[1] = -1;  /* prevent double-close */
+			(void) stream_signal_upstream_done(specs, done_lsn, confirm_lsn);
 		}
 	}
 	else if (!time_to_abort)

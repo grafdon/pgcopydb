@@ -159,6 +159,7 @@ jobs:
           - cdc-receive-group-commit
           - cdc-endpos-before-txn
           - cdc-wal-workers
+          - cdc-wal-workers-endpos
           - wal-workers-assign
         exclude:
           # timescaledb uses timescale/timescaledb:latest-pg13 for both source

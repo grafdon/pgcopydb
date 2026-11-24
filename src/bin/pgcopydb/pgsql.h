@@ -586,6 +586,18 @@ bool pgsql_copy_logical_replication_slot(PGSQL *pgsql,
 bool pgsql_check_wal_worker_slot(PGSQL *pgsql,
 								 const char *slotName,
 								 uint64_t lsn);
+bool pgsql_replication_slot_inactive_lsn(PGSQL *pgsql,
+										 const char *slotName,
+										 uint64_t *lsn);
+bool pgsql_replication_slot_advance(PGSQL *pgsql,
+									const char *slotName,
+									uint64_t lsn,
+									uint64_t *endLSN);
+bool pgsql_wal_worker_publications_mismatch(PGSQL *pgsql,
+											const char *slotName,
+											const char *oids,
+											char *mismatch,
+											size_t size);
 bool pgsql_drop_wal_worker_slots(PGSQL *pgsql, const char *slotName);
 bool pgsql_drop_wal_worker_origins(PGSQL *pgsql, const char *origin);
 bool pgsql_drop_wal_worker_publications(PGSQL *pgsql,

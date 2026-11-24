@@ -859,8 +859,8 @@ wait "${pid}" || true
 settled 'a killed supervisor, within 15 s'
 echo "OK a killed supervisor stopped every worker"
 
-# a stop request wins over workers that record done: with endpos ahead, their
-# receive and apply stop on SIGTERM, while the paused supervisor holds one too
+# a signal is no finish: with endpos ahead, receive and apply stop on SIGTERM
+# and no worker reaches endpos, while the paused supervisor holds one too
 resume_workers /tmp/kill-stop.log
 wpids=$(pgrep -f '^pgcopydb: follow worker [0-9]+( |$)' | paste -sd ' ') || true
 [ "$(wc -w <<< "${wpids}")" -eq 3 ] || fail_kill "WAL workers: [${wpids}]"
@@ -909,11 +909,11 @@ kill -CONT "${pid}"
 wait_exit
 settled 'a stop request'
 if [ "${rc}" -eq 0 ] || [ "${rc}" -eq 124 ] ||
-   [ "$(grep -c 'has reached endpos' "${log}")" -ne 3 ] ||
+   [ "$(grep -c 'has reached endpos' "${log}")" -ne 0 ] ||
    ! grep -qF 'Follow mode stopped before every WAL worker reached endpos' "${log}"; then
-    fail_kill "a stop request with every worker done left exit ${rc}"
+    fail_kill "workers stopped by a signal left exit ${rc}"
 fi
-echo "OK a stop request wins over workers that report done, exit ${rc}"
+echo "OK workers stopped by a signal reach no endpos, exit ${rc}"
 
 wait_slots_inactive
 expect 0 "Dropping replication slot \"${S}_w2\"" /tmp/kill-cleanup.log \
