@@ -511,14 +511,22 @@ ld_store_set_cdc_filename_at_lsn(StreamSpecs *specs, uint64_t lsn)
 		if (!ld_store_lookup_output_after_lsn(candidateDB, lsn, lsn, &output))
 		{
 			/* errors have already been logged */
-			sqlite3_close(probeDB);
-			candidateDB->db = NULL;
+			(void) catalog_close(candidateDB);
 			free(candidateDB);
 			return false;
 		}
 
-		sqlite3_close(probeDB);
-		candidateDB->db = NULL;
+		/*
+		 * The lookup cached its statement on the probe handle: catalog_close
+		 * finalizes it, a bare sqlite3_close would fail and leave the entry
+		 * for catalog_init below to inherit.
+		 */
+		if (!catalog_close(candidateDB))
+		{
+			/* errors have already been logged */
+			free(candidateDB);
+			return false;
+		}
 
 		if (output.lsn != InvalidXLogRecPtr)
 		{
@@ -733,7 +741,7 @@ ld_store_lookup_output_after_lsn(DatabaseCatalog *catalog,
 	};
 
 
-	if (!catalog_sql_prepare(db, sql, &query))
+	if (!catalog_sql_prepare_cached(catalog, sql, &query))
 	{
 		/* errors have already been logged */
 		return false;
@@ -810,7 +818,7 @@ ld_store_lookup_output_xid_end(DatabaseCatalog *catalog,
 		.fetchFunction = &ld_store_output_fetch
 	};
 
-	if (!catalog_sql_prepare(db, sql, &query))
+	if (!catalog_sql_prepare_cached(catalog, sql, &query))
 	{
 		/* errors have already been logged */
 		return false;
@@ -2262,7 +2270,7 @@ ld_store_insert_replay_stmt(DatabaseCatalog *catalog,
 
 		SQLiteQuery query = { 0 };
 
-		if (!catalog_sql_prepare(db, sql, &query))
+		if (!catalog_sql_prepare_cached(catalog, sql, &query))
 		{
 			/* errors have already been logged */
 			(void) semaphore_unlock(&(catalog->sema));
@@ -2300,7 +2308,7 @@ ld_store_insert_replay_stmt(DatabaseCatalog *catalog,
 
 	SQLiteQuery query = { 0 };
 
-	if (!catalog_sql_prepare(db, sql, &query))
+	if (!catalog_sql_prepare_cached(catalog, sql, &query))
 	{
 		/* errors have already been logged */
 		(void) semaphore_unlock(&(catalog->sema));
@@ -2861,7 +2869,7 @@ ld_store_iter_output_init(ReplayDBOutputIterator *iter)
 	int count = sizeof(params) / sizeof(params[0]);
 
 
-	if (!catalog_sql_prepare(db, sql, query))
+	if (!catalog_sql_prepare_cached(catalog, sql, query))
 	{
 		/* errors have already been logged */
 		return false;
@@ -3293,7 +3301,7 @@ ld_store_replay_next_event(DatabaseCatalog *catalog,
 		.fetchFunction = &ld_store_replay_event_fetch
 	};
 
-	if (!catalog_sql_prepare(db, sql, &query))
+	if (!catalog_sql_prepare_cached(catalog, sql, &query))
 	{
 		/* errors have already been logged */
 		return false;
@@ -3363,7 +3371,7 @@ ld_store_iter_replay_txn_init(ReplayDBReplayTxnIterator *iter)
 	query->context = iter->current;
 	query->fetchFunction = &ld_store_replay_fetch;
 
-	if (!catalog_sql_prepare(db, sql, query))
+	if (!catalog_sql_prepare_cached(catalog, sql, query))
 	{
 		/* errors have already been logged */
 		return false;
