@@ -111,8 +111,7 @@ release_row() {
 }
 
 # interrupt <tag> <how> <first id - 1>: stop follow halfway through a backlog, then resume.
-# The middle row is held, so the stop lands before the backlog is applied.
-# No exit status check: a follow stopped by SIGTERM can exit 0 (apply records itself done).
+# The middle row is held, so the stop lands while apply waits on it in pipeline sync.
 interrupt() {
     local n
     hold_row $(($3 + backlog / 2))
@@ -127,10 +126,40 @@ interrupt() {
     n=$(count "$1")
     echo "$1: follow exited ${rc} after $2 with ${n} of ${backlog} rows applied"
     test "${n}" -lt "${backlog}" || fail "$2 came after the whole backlog, so it checks nothing"
+    # SIGTERM fails the pipeline sync that waits on the held row, so follow exits 12
+    test "$2" != term -o "${rc}" = 12 || fail "SIGTERM in pipeline sync made follow exit ${rc}, not 12"
     replay_not_ahead "$1"
 
     start_follow "resume-$1"
     poll "the rest of $1" 300 applied "$1" "${backlog}"
+}
+
+# term_idle <first id - 1>: SIGTERM once apply has caught up with half a backlog and a paused
+# receive holds back the rest. With no target work left apply takes the clean stop at the top
+# of its loop, so follow exits 0 short of the backlog and the resume must apply the rest.
+term_idle() {
+    local n rpid half=$((backlog / 2))
+    insert_txns $(($1 + 1)) $(($1 + half)) term-idle
+    poll 'the first term-idle rows' 120 applied term-idle "${half}"
+    rpid=$(pgrep -f '^pgcopydb: follow receive') || fail 'no receive process'
+    kill -STOP "${rpid}"
+    insert_txns $(($1 + half + 1)) $(($1 + backlog)) term-idle
+    kill -TERM -- "-${follow_pid}"
+    kill -CONT "${rpid}"
+    wait_follow 120
+    n=$(count term-idle)
+    echo "term-idle: follow exited ${rc} after SIGTERM with ${n} of ${backlog} rows applied"
+    test "${rc}" = 0 || fail "follow stopped by SIGTERM between groups exited ${rc}"
+    test "${n}" = "${half}" || fail "${n} term-idle rows applied at the stop, expected ${half}"
+    grep -q 'Apply process received a shutdown signal, stopping' "${follow_log}" ||
+        fail 'apply did not take the clean stop at the top of its loop'
+    if grep -E 'Pipeline sync was interrupted|Failed to commit' "${follow_log}"; then
+        fail 'SIGTERM between groups reached a target commit'
+    fi
+    replay_not_ahead term-idle
+
+    start_follow resume-term-idle
+    poll 'the rest of term-idle' 300 applied term-idle "${backlog}"
 }
 
 pgcopydb ping
@@ -163,6 +192,7 @@ test "${ms}" -lt "${limit_ms}" ||
 
 interrupt crash kill-apply 1000
 interrupt term term 10000
+term_idle 15000
 
 # receive stops short of an endpos that lies past the lag rows
 rpid=$(pgrep -f '^pgcopydb: follow receive') || fail 'no receive process'
