@@ -4,7 +4,7 @@
 # Usage: analyze.sh OUT
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
-# shellcheck source=../probe/lib.sh
+# shellcheck source-path=SCRIPTDIR source=../probe/lib.sh
 source "$here/../probe/lib.sh"
 OUT=$(cd "${1:?usage: analyze.sh OUT}" && pwd)
 W=/var/run/pgcopydb

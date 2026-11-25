@@ -5,7 +5,7 @@
 # Usage: run.sh OUT [TXNS]   (PERF_S: seconds of apply to sample, default 40)
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
-# shellcheck source=../probe/lib.sh
+# shellcheck source-path=SCRIPTDIR source=../probe/lib.sh
 source "$here/../probe/lib.sh"
 OUT=${1:?usage: run.sh OUT [TXNS]}
 txns=${2:-320000}

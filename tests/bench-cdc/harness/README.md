@@ -122,6 +122,7 @@ The report lists every run left out with its reasons, including the attempts the
 ## Commands
 
 Set `BENCH_LOCK` to the shared lock directory (see "Rules for local runs"), take an empty results directory outside the repository, and run a matrix, then the report.
+Run the commands of this section from `tests/bench-cdc/harness`.
 
 ```sh
 ./matrix-rel.sh "$OUT" A
@@ -158,7 +159,8 @@ The report groups runs that are not full size apart from the full-size ones and 
 
 The harness, the probe and the profile share one podman machine with other benchmarks and with the Compose suites.
 
-1. Set the environment: a `docker` command that runs podman on the PATH, `PGVERSION` exported, the repository as the working directory, and `BENCH_LOCK` set to the lock directory that every user of this podman machine shares.
+1. Set the environment: a `docker` command that runs podman on the PATH, `PGVERSION` exported, and `BENCH_LOCK` set to the lock directory that every user of this podman machine shares.
+   Run builds and `make` targets from the top of the repository, the harness commands from `tests/bench-cdc/harness` (see "Commands"), and the profile from `tests/bench-cdc` (see "Profile").
 2. Hold the lock for every command that builds an image or runs a container, and release it right after.
    The harness scripts take it themselves; around a build or a suite, put acquire, command and release in one shell call.
 
@@ -192,6 +194,7 @@ Ten suites build their source at PostgreSQL 16 whatever `PGVERSION` says, becaus
 
 ## Profile
 
+Run these from `tests/bench-cdc`.
 `profile/run.sh OUT [TXNS]` runs one follow at one worker on workload A under `perf`, receive and apply each, and `profile/analyze.sh OUT` turns the samples into the groups of `classify.py`.
 Both use the probe's `lib.sh`, so they need `BENCH_LOCK` too.
 `run.sh` lowers `kernel.perf_event_paranoid` in the podman machine for the run and sets it back at the end.
