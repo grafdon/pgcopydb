@@ -1,0 +1,4 @@
+# probe-py: the Python the probe runs in; the scripts are mounted, not copied.
+FROM docker.io/library/python:3.13-slim
+RUN pip install --no-cache-dir "psycopg[binary]==3.2.*"
+ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1

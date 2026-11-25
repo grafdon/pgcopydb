@@ -1,0 +1,11 @@
+# label variant: base and candidate alternate, so drift spreads evenly
+QB01 BASE-1
+QB02 CAND-1
+QB03 BASE-1
+QB04 CAND-1
+QB05 BASE-1
+QB06 CAND-1
+QB07 BASE-1
+QB08 CAND-1
+QB09 BASE-1
+QB10 CAND-1
