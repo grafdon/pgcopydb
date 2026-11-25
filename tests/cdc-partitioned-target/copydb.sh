@@ -3,7 +3,7 @@
 set -x
 set -e
 
-# Regression test for two related fixes against partitioned target tables:
+# Regression test for three related fixes against partitioned target tables:
 #
 #   1. pgcopydb copy table-data must use TRUNCATE (not TRUNCATE ONLY) and
 #      skip COPY FREEZE when the target is partitioned. Otherwise the
@@ -15,6 +15,10 @@ set -e
 #      ld_transform to plain "TRUNCATE <qname>" when the target relation
 #      is partitioned. Otherwise stream catchup errors with the same
 #      "cannot truncate only" message and apply stops.
+#
+#   3. CDC UPDATE and DELETE must change the named table only, so that an
+#      inheritance child keeps its rows, and must drop that ONLY again when
+#      the target relation is partitioned, where it matches no row.
 #
 # Source has a flat table (relkind='r'); target has a partitioned table
 # (relkind='p') with the same qualified name.
@@ -93,15 +97,58 @@ if [ "${keyless}" != "1|b" ]; then
     exit 1
 fi
 
-# Phase 2: drive a TRUNCATE through CDC. Without fix #2 catchup errors
-# here; with the fix the target ends up empty.
-psql -a -d "${PGCOPYDB_SOURCE_PGURI}" -f /usr/src/pgcopydb/dml-truncate.sql
+# Phase 2: UPDATE and DELETE change the named table only, except on a
+# partitioned target, where ONLY would match no row. Every check runs before
+# the phase fails, so one output shows each of them.
+psql -a -d "${PGCOPYDB_SOURCE_PGURI}" -f /usr/src/pgcopydb/dml-only.sql
 
 lsn2=$(psql -At -d "${PGCOPYDB_SOURCE_PGURI}" \
             -c 'select pg_current_wal_flush_lsn()')
 
 pgcopydb stream prefetch --resume --endpos "${lsn2}" --notice
 pgcopydb stream catchup --resume --endpos "${lsn2}" --notice
+
+failed=0
+
+check() {
+    local got
+    got=$(psql -At -d "${PGCOPYDB_TARGET_PGURI}" -c "$2")
+
+    if [ "${got}" != "$3" ]; then
+        echo "FAIL: $1: got '${got}', expected '$3'"
+        failed=1
+    fi
+}
+
+rows="string_agg(concat_ws(':', id, v), ',' order by id)"
+check 'inheritance parent' \
+      "select ${rows} from only partitioned_target.ip" '1:changed'
+check 'inheritance child' \
+      "select ${rows} from only partitioned_target.ic" '1:c1,2:c2'
+
+rows="string_agg(concat_ws(':', id, payload), ',' order by id)"
+check 'partitioned keyed' \
+      "select ${rows} from partitioned_target.events" '1:A,2:b,4:d,5:e'
+
+rows="string_agg(concat_ws(':', id, \"x FROM ONLY y\"), ',' order by id)"
+check 'partitioned keyed, ONLY in names' \
+      "select ${rows} from partitioned_target.\"k ONLY k\"" '1:A'
+
+rows="string_agg(concat_ws(':', bucket, \"x FROM ONLY y\"), ',' order by bucket)"
+check 'partitioned keyless, ONLY in names' \
+      "select ${rows} from partitioned_target.\"n ONLY n\"" '0:A'
+
+test "${failed}" -eq 0
+
+# Phase 3: drive a TRUNCATE through CDC. Without fix #2 catchup errors
+# here; with the fix the target ends up empty.
+psql -a -d "${PGCOPYDB_SOURCE_PGURI}" -f /usr/src/pgcopydb/dml-truncate.sql
+
+lsn3=$(psql -At -d "${PGCOPYDB_SOURCE_PGURI}" \
+            -c 'select pg_current_wal_flush_lsn()')
+
+pgcopydb stream prefetch --resume --endpos "${lsn3}" --notice
+pgcopydb stream catchup --resume --endpos "${lsn3}" --notice
 
 # The apply/catchup process performed the inline transform, so the stmt table
 # now holds the TRUNCATE template.  Assert the transform emitted "TRUNCATE ONLY"
