@@ -64,7 +64,7 @@ docker build --build-arg PGVERSION=18 -t pgcopydb-bench:cand .
 ```
 
 The archive holds neither `version` nor `GIT-VERSION-FILE`, which the `Dockerfile` copies, and `GIT-VERSION-GEN` takes `VERSION` when there is no `version` file.
-The `docker build` lines are the one of `make force-build` with another tag.
+Each `docker build` line is the command that `make force-build` runs, with another tag.
 `WANT_CAND` is the content of the file `version` after the second `make version`; a `-dirty` suffix is expected while tracked files are modified.
 No rule compares with the numbers of a published runner image: build the base right before the measurement, with the same recipe.
 
