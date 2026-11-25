@@ -36,7 +36,6 @@ source_sql() { timeout 60s psql -AtqX -v ON_ERROR_STOP=1 -d "${PGCOPYDB_SOURCE_P
 target_sql() { timeout 60s psql -AtqX -v ON_ERROR_STOP=1 -d "${PGCOPYDB_TARGET_PGURI}" -c "$1"; }
 count() { target_sql "select count(*) from t where v = '$1'"; }
 applied() { test "$(count "$1")" = "$2"; }
-at_least() { test "$(count "$1")" -ge "$2"; }
 now_ms() { echo $(($(date +%s%N) / 1000000)); }
 lsn() { echo $(((16#${1%/*} << 32) + 16#${1#*/})); }
 origin() { target_sql "select pg_replication_origin_progress('pgcopydb', true)"; }
@@ -88,6 +87,7 @@ wait_follow() {
 
 holders() { target_sql "select count(*) from pg_stat_activity where application_name = 'holder'$1"; }
 holder_sleeps() { test "$(holders " and wait_event = 'PgSleep'")" = 1; }
+holder_blocks() { test "$(holders " and pid in (select unnest(pg_blocking_pids(a.pid)) from pg_stat_activity a)")" = 1; }
 
 # hold_row <id>: an open target transaction inserts id, so apply waits on that row
 # however fast it is; pg_sleep never reads the socket, so only pg_terminate_backend ends it
@@ -116,7 +116,7 @@ interrupt() {
     local n
     hold_row $(($3 + backlog / 2))
     insert_txns $(($3 + 1)) $(($3 + backlog)) "$1"
-    poll "the first $1 rows" 120 at_least "$1" 50
+    poll "apply to wait on the held row" 120 holder_blocks
     case "$2" in
         kill-apply) pkill -KILL -f '^pgcopydb: follow apply' || fail 'no apply process to kill' ;;
         term) kill -TERM -- "-${follow_pid}" ;;
@@ -153,8 +153,8 @@ term_idle() {
     test "${n}" = "${half}" || fail "${n} term-idle rows applied at the stop, expected ${half}"
     grep -q 'Apply process received a shutdown signal, stopping' "${follow_log}" ||
         fail 'apply did not take the clean stop at the top of its loop'
-    if grep -E 'Pipeline sync was interrupted|Failed to commit' "${follow_log}"; then
-        fail 'SIGTERM between groups reached a target commit'
+    if grep -E 'Apply leaves|Pipeline sync was interrupted|Failed to commit' "${follow_log}"; then
+        fail 'SIGTERM between groups found a group open or reached a target commit'
     fi
     replay_not_ahead term-idle
 
