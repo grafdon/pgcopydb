@@ -14,12 +14,13 @@ backlog=2000
 TMPDIR=$(mktemp -d /tmp/pgcopydb-apply-wakeup.XXXXXX)
 export TMPDIR
 export XDG_DATA_HOME=${TMPDIR}/cdc
-snapshot_pid='' follow_pid='' follow_log='' rc=''
+snapshot_pid='' follow_pid='' follow_log='' rc='' holder_pid=''
 
 cleanup() {
     local status=$?
     trap - EXIT
     test -z "${follow_pid}" || kill -KILL -- "-${follow_pid}" 2>/dev/null || true
+    test -z "${holder_pid}" || kill -TERM "${holder_pid}" 2>/dev/null || true
     test -z "${snapshot_pid}" || kill -TERM "${snapshot_pid}" 2>/dev/null || true
     if test "${status}" -ne 0; then
         for log in "${TMPDIR}"/*.log; do
@@ -85,16 +86,43 @@ wait_follow() {
     follow_pid=
 }
 
+holders() { target_sql "select count(*) from pg_stat_activity where application_name = 'holder'$1"; }
+holder_sleeps() { test "$(holders " and wait_event = 'PgSleep'")" = 1; }
+
+# hold_row <id>: an open target transaction inserts id, so apply waits on that row
+# however fast it is; pg_sleep never reads the socket, so only pg_terminate_backend ends it
+hold_row() {
+    PGAPPNAME=holder psql -AtqX -v ON_ERROR_STOP=1 -d "${PGCOPYDB_TARGET_PGURI}" -c 'begin' \
+        -c "insert into t values ($1, 'holder')" -c 'select pg_sleep(600)' > "${TMPDIR}/holder.log" 2>&1 &
+    holder_pid=$!
+    poll "the holder of row $1" 60 holder_sleeps
+}
+
+release_row() {
+    local deadline=$((SECONDS + 30))
+    target_sql "select count(pg_terminate_backend(pid)) from pg_stat_activity
+        where application_name = 'holder'" > /dev/null
+    wait "${holder_pid}" || true
+    holder_pid=
+    until test "$(holders '')" = 0; do
+        test "${SECONDS}" -lt "${deadline}" || fail 'the holder session did not end'
+        sleep 0.2
+    done
+}
+
 # interrupt <tag> <how> <first id - 1>: stop follow halfway through a backlog, then resume.
+# The middle row is held, so the stop lands before the backlog is applied.
 # No exit status check: a follow stopped by SIGTERM can exit 0 (apply records itself done).
 interrupt() {
     local n
+    hold_row $(($3 + backlog / 2))
     insert_txns $(($3 + 1)) $(($3 + backlog)) "$1"
     poll "the first $1 rows" 120 at_least "$1" 50
     case "$2" in
         kill-apply) pkill -KILL -f '^pgcopydb: follow apply' || fail 'no apply process to kill' ;;
         term) kill -TERM -- "-${follow_pid}" ;;
     esac
+    release_row
     wait_follow 120
     n=$(count "$1")
     echo "$1: follow exited ${rc} after $2 with ${n} of ${backlog} rows applied"
