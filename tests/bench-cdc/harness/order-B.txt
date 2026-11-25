@@ -1,0 +1,13 @@
+# label variant: blocks of four hold each variant once, so drift spreads evenly
+B01 V27-1
+B02 V27-8HT
+B03 V26-1
+B04 V27-8
+B05 V27-8HT
+B06 V26-1
+B07 V27-8
+B08 V27-1
+B09 V26-1
+B10 V27-8
+B11 V27-1
+B12 V27-8HT

@@ -1,0 +1,22 @@
+# probe-pgcopydb-prof: pgcopydb at 9d8b660 with debug info and frame pointers
+# at the optimisation level of its Makefile (-O2), plus perf, gdb and python3.
+# The build context holds ctx/, the sources of that commit (../harness/README.md, "Profile").
+FROM docker.io/library/debian:12-slim
+ARG PGVERSION=18
+RUN apt-get update && apt-get install -qqy --no-install-recommends curl ca-certificates gnupg \
+ && curl -fsS https://www.postgresql.org/media/keys/ACCC4CF8.asc | gpg --dearmor -o /usr/share/keyrings/pgdg.gpg \
+ && echo "deb [signed-by=/usr/share/keyrings/pgdg.gpg] http://apt.postgresql.org/pub/repos/apt bookworm-pgdg main ${PGVERSION}" >/etc/apt/sources.list.d/pgdg.list \
+ && apt-get update && apt-get install -qqy --no-install-recommends \
+    build-essential libedit-dev libgc-dev libicu-dev libkrb5-dev liblz4-dev libncurses-dev libnuma-dev libpam-dev \
+    libpq-dev libreadline-dev libselinux1-dev libssl-dev libxml2-dev libxslt1-dev libzstd-dev zlib1g-dev \
+    postgresql-server-dev-${PGVERSION} postgresql-client-${PGVERSION} \
+    gdb linux-perf libc6-dbg python3-minimal procps psmisc \
+ && (apt-get install -qqy --no-install-recommends libpq5-dbgsym || echo "no libpq5-dbgsym") \
+ && rm -rf /var/lib/apt/lists/*
+WORKDIR /usr/src/pgcopydb
+COPY ctx/ .
+RUN make -s clean && make -s -j"$(nproc)" CFLAGS="-g -fno-omit-frame-pointer" install \
+ && install -m 0755 src/bin/pgcopydb/pgcopydb /usr/local/bin/pgcopydb && pgcopydb --version
+RUN useradd -rm -d /var/lib/postgres -s /bin/bash -g postgres docker \
+ && mkdir -p /var/run/pgcopydb && chown docker:postgres /var/run/pgcopydb
+USER docker

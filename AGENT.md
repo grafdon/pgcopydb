@@ -230,7 +230,8 @@ make clean
 ### How tests work
 
 Every suite under `tests/<name>/` is a Docker Compose project with three
-services:
+services (`tests/bench-cdc` is not a suite: it is a local benchmark harness
+outside CI, see `tests/bench-cdc/harness/README.md`):
 
 | Service | Role |
 |---------|------|
