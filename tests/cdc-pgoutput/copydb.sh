@@ -187,7 +187,7 @@ multi_delete_count=$(sqlite3 -init /dev/null -list -noheader ${REPLAYDB} \
     "select count(*)
      from stmt s
      join replay r on r.stmt_hash = s.hash
-     where s.sql like 'DELETE FROM \"public\".\"multi_delete_test\" %'")
+     where s.sql like 'DELETE FROM ONLY \"public\".\"multi_delete_test\" %'")
 
 echo "multi_delete_count (expected 1 batched statement): ${multi_delete_count}"
 test "${multi_delete_count}" -eq 1
@@ -196,7 +196,7 @@ multi_delete_composite_count=$(sqlite3 -init /dev/null -list -noheader ${REPLAYD
     "select count(*)
      from stmt s
      join replay r on r.stmt_hash = s.hash
-     where s.sql like 'DELETE FROM \"public\".\"multi_delete_composite_test\" %'")
+     where s.sql like 'DELETE FROM ONLY \"public\".\"multi_delete_composite_test\" %'")
 
 echo "multi_delete_composite_count (expected 1 batched statement): ${multi_delete_composite_count}"
 test "${multi_delete_composite_count}" -eq 1

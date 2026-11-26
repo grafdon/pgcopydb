@@ -132,7 +132,7 @@ multi_delete_count=$(sqlite3 -init /dev/null -list -noheader ${REPLAYDB} \
     "select count(*)
      from stmt s
      join replay r on r.stmt_hash = s.hash
-     where s.sql like 'DELETE FROM public.multi_delete_test %'")
+     where s.sql like 'DELETE FROM ONLY public.multi_delete_test %'")
 
 echo "multi_delete_count (expected 1 batched statement): ${multi_delete_count}"
 test "${multi_delete_count}" -eq 1
@@ -141,7 +141,7 @@ multi_delete_composite_count=$(sqlite3 -init /dev/null -list -noheader ${REPLAYD
     "select count(*)
      from stmt s
      join replay r on r.stmt_hash = s.hash
-     where s.sql like 'DELETE FROM public.multi_delete_composite_test %'")
+     where s.sql like 'DELETE FROM ONLY public.multi_delete_composite_test %'")
 
 echo "multi_delete_composite_count (expected 1 batched statement): ${multi_delete_composite_count}"
 test "${multi_delete_composite_count}" -eq 1
@@ -188,7 +188,7 @@ done
 pgcopydb stream apply --target - > /tmp/apply-stdout.sql
 
 allnull=$(sqlite3 -init /dev/null -list -noheader ${REPLAYDB} \
-    "select hash from stmt where sql like 'DELETE FROM public.ri_full_allnulldel %'")
+    "select hash from stmt where sql like 'DELETE FROM ONLY public.ri_full_allnulldel %'")
 
 test -n "${allnull}"
 grep -x "EXECUTE ${allnull}" /tmp/apply-stdout.sql
@@ -220,7 +220,7 @@ noop_update_count=$(sqlite3 -init /dev/null -list -noheader ${REPLAYDB} \
     "select count(*)
      from stmt s
      join replay r on r.stmt_hash = s.hash
-     where s.sql like 'UPDATE public.noop_update_test%'")
+     where s.sql like 'UPDATE ONLY public.noop_update_test%'")
 
 echo "noop_update_count with --replay-no-op-updates: ${noop_update_count}"
 test "${noop_update_count}" -ge 1

@@ -198,6 +198,11 @@ In practice the two following options are to be considered:
 	When this is used on a table, then the WAL records contain the old
 	values of all columns in the row.
 
+An UPDATE or a DELETE applies to the named table only, so the rows of the
+tables that inherit from it on the target stay unchanged. A table that is
+partitioned on the target is the exception: there the change reaches the
+partition that holds the row.
+
 Logical Decoding Pre-Fetching
 -----------------------------
 

@@ -32,3 +32,31 @@ create table partitioned_target.keyless_a
 
 create table partitioned_target.keyless_b
     partition of partitioned_target.keyless for values in (1);
+
+create table partitioned_target.ip (id integer primary key, v text);
+create table partitioned_target.ic () inherits (partitioned_target.ip);
+alter table partitioned_target.ic add primary key (id);
+
+create table partitioned_target."k ONLY k" (
+    id bigint not null,
+    bucket smallint not null,
+    "x FROM ONLY y" text,
+    primary key (id, bucket)
+) partition by list (bucket);
+
+create table partitioned_target."k ONLY k_a"
+    partition of partitioned_target."k ONLY k" for values in (0);
+
+create table partitioned_target."k ONLY k_b"
+    partition of partitioned_target."k ONLY k" for values in (1);
+
+create table partitioned_target."n ONLY n" (
+    bucket smallint not null,
+    "x FROM ONLY y" text
+) partition by list (bucket);
+
+create table partitioned_target."n ONLY n_a"
+    partition of partitioned_target."n ONLY n" for values in (0);
+
+create table partitioned_target."n ONLY n_b"
+    partition of partitioned_target."n ONLY n" for values in (1);

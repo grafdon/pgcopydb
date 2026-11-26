@@ -2219,7 +2219,7 @@ stream_write_update(bool replayNoOpUpdates,
 		/*
 		 * First, the PREPARE part.
 		 */
-		appendPQExpBuffer(buf, "UPDATE %s.%s SET ",
+		appendPQExpBuffer(buf, "UPDATE ONLY %s.%s SET ",
 						  update->table.nspname,
 						  update->table.relname);
 		int pos = 0;
@@ -2328,7 +2328,7 @@ stream_write_update(bool replayNoOpUpdates,
 		{
 			appendPQExpBuffer(buf,
 							  " WHERE (tableoid, ctid) = "
-							  "(SELECT tableoid, ctid FROM %s.%s WHERE ",
+							  "(SELECT tableoid, ctid FROM ONLY %s.%s WHERE ",
 							  update->table.nspname,
 							  update->table.relname);
 		}
@@ -2445,10 +2445,10 @@ stream_write_update(bool replayNoOpUpdates,
  * statement is emitted:
  *
  *   Single-column identity:
- *     DELETE FROM ns.tbl WHERE col IN ($1, $2, $3)
+ *     DELETE FROM ONLY ns.tbl WHERE col IN ($1, $2, $3)
  *
  *   Multi-column identity:
- *     DELETE FROM ns.tbl WHERE (k1, k2) IN (($1, $2), ($3, $4))
+ *     DELETE FROM ONLY ns.tbl WHERE (k1, k2) IN (($1, $2), ($3, $4))
  *
  * The batch form is only used when all identity values are non-NULL, which
  * canCoalesceLogicalTransactionStatement guarantees.  A single row with NULL
@@ -2482,7 +2482,7 @@ stream_write_delete(ReplayDBStmt *replayStmt, LogicalMessageDelete *delete)
 		JSON_Value *js = json_value_init_array();
 		JSON_Array *jsArray = json_value_get_array(js);
 
-		appendPQExpBuffer(buf, "DELETE FROM %s.%s WHERE ",
+		appendPQExpBuffer(buf, "DELETE FROM ONLY %s.%s WHERE ",
 						  delete->table.nspname,
 						  delete->table.relname);
 
@@ -2490,7 +2490,7 @@ stream_write_delete(ReplayDBStmt *replayStmt, LogicalMessageDelete *delete)
 		{
 			appendPQExpBuffer(buf,
 							  "(tableoid, ctid) = "
-							  "(SELECT tableoid, ctid FROM %s.%s WHERE ",
+							  "(SELECT tableoid, ctid FROM ONLY %s.%s WHERE ",
 							  delete->table.nspname,
 							  delete->table.relname);
 		}
