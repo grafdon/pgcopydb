@@ -26,7 +26,7 @@ done
 # main.c defines globals the other objects use, so it links without its main()
 "${cc[@]}" -Dmain=pgcopydb_main -Wno-missing-prototypes -c main.c -o /tmp/main.o
 
-for name in stmt-cache pgoutput-store; do
+for name in stmt-cache pgoutput-store apply-store; do
     "${cc[@]}" -I. -c "${here}/${name}.c" -o "/tmp/${name}.o"
     "${cc[@]}" "/tmp/${name}.o" /tmp/main.o "${objs[@]}" "${libs[@]}" -o "/tmp/${name}"
     ASAN_OPTIONS=${ASAN_OPTIONS:-detect_leaks=0} "/tmp/${name}"
