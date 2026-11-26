@@ -1487,8 +1487,8 @@ cli_stream_apply(int argc, char **argv)
 	 * Open outputDB (its filename is looked up in the cdc_files table of
 	 * sourceDB) and derive + open replayDB from the outputDB path.
 	 *
-	 * In stdoutMode these two calls are combined with an inline transform
-	 * pass that populates replayDB from outputDB before stream_apply_to_stdout
+	 * In stdoutMode these two calls are combined with the inline transform,
+	 * whose passes populate replayDB from outputDB before stream_apply_to_stdout
 	 * reads from the replay table.
 	 */
 	if (!ld_store_open_outputdb(&specs))
@@ -1523,17 +1523,45 @@ cli_stream_apply(int argc, char **argv)
 		}
 
 		/*
-		 * Start from the beginning of the output table (replay_lsn == 0).
-		 * Any rows previously transformed are skipped by the cursor inside
-		 * ld_store_iter_output (it uses replay_lsn as the start position).
+		 * A pass hands over one transaction or one marker, so repeat from the
+		 * beginning of the output table until a pass moves neither cursor.
+		 * Both cursors only grow, which ends the loop on any output table.
 		 */
-		specs.sentinel.replay_lsn = InvalidXLogRecPtr;
+		uint64_t previousLSN = InvalidXLogRecPtr;
+		uint64_t keepaliveLSN = InvalidXLogRecPtr;
+		LogicalMessageMetadata *last = &(specs.private.metadata);
 
-		if (!stream_transform_from_outputdb(&specs,
-											InvalidXLogRecPtr,
-											InvalidXLogRecPtr))
+		for (;;)
 		{
-			exit(EXIT_CODE_INTERNAL_ERROR);
+			if (!stream_transform_from_outputdb(&specs,
+												previousLSN,
+												keepaliveLSN))
+			{
+				exit(EXIT_CODE_INTERNAL_ERROR);
+			}
+
+			if ((last->action == STREAM_ACTION_COMMIT ||
+				 last->action == STREAM_ACTION_ROLLBACK) &&
+				last->lsn > previousLSN)
+			{
+				previousLSN = last->lsn;
+			}
+			else if ((last->action == STREAM_ACTION_KEEPALIVE ||
+					  last->action == STREAM_ACTION_SWITCH) &&
+					 last->lsn > keepaliveLSN)
+			{
+				keepaliveLSN = last->lsn;
+			}
+			else
+			{
+				break;
+			}
+
+			if (specs.endpos != InvalidXLogRecPtr &&
+				specs.endpos <= previousLSN)
+			{
+				break;
+			}
 		}
 
 		if (!stream_apply_to_stdout(&specs, stdout))
