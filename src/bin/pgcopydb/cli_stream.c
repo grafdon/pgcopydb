@@ -1523,16 +1523,54 @@ cli_stream_apply(int argc, char **argv)
 		}
 
 		/*
-		 * A pass hands over one transaction or one marker, so repeat from the
-		 * beginning of the output table until a pass moves neither cursor.
-		 * Both cursors only grow, which ends the loop on any output table.
+		 * Skip what replayDB already holds, as the apply driver does when it
+		 * drains replayDB before it transforms, or a filled directory gets
+		 * every transaction twice.  The cursors only grow, so this ends.
 		 */
 		uint64_t previousLSN = InvalidXLogRecPtr;
 		uint64_t keepaliveLSN = InvalidXLogRecPtr;
+
+		for (;;)
+		{
+			ReplayDBStmt s = { 0 };
+
+			if (!ld_store_replay_next_event(specs.replayDB,
+											previousLSN,
+											keepaliveLSN,
+											&s))
+			{
+				/* errors have already been logged */
+				exit(EXIT_CODE_INTERNAL_ERROR);
+			}
+
+			if (s.action == STREAM_ACTION_BEGIN && s.endlsn > previousLSN)
+			{
+				previousLSN = s.endlsn;
+			}
+			else if (s.action == STREAM_ACTION_KEEPALIVE)
+			{
+				keepaliveLSN = s.lsn;
+			}
+			else
+			{
+				break;
+			}
+		}
+
+		/*
+		 * A pass hands over one transaction or one marker, so repeat until a
+		 * pass moves neither cursor.
+		 */
 		LogicalMessageMetadata *last = &(specs.private.metadata);
 
 		for (;;)
 		{
+			if (specs.endpos != InvalidXLogRecPtr &&
+				specs.endpos <= previousLSN)
+			{
+				break;
+			}
+
 			if (!stream_transform_from_outputdb(&specs,
 												previousLSN,
 												keepaliveLSN))
@@ -1553,12 +1591,6 @@ cli_stream_apply(int argc, char **argv)
 				keepaliveLSN = last->lsn;
 			}
 			else
-			{
-				break;
-			}
-
-			if (specs.endpos != InvalidXLogRecPtr &&
-				specs.endpos <= previousLSN)
 			{
 				break;
 			}
