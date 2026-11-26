@@ -73,6 +73,8 @@ static bool stream_apply_load_target_relkinds(StreamApplyContext *context);
 
 static bool stream_apply_dml(StreamApplyContext *context, ReplayDBStmt *s);
 static bool stream_apply_truncate(StreamApplyContext *context, const char *sql);
+static bool stream_apply_prepare(StreamApplyContext *context, const char *name,
+								 const char *sql);
 static bool stream_apply_group_open(StreamApplyContext *context);
 static bool stream_apply_group_rollback(StreamApplyContext *context);
 static bool stream_apply_group_close(StreamApplyContext *context,
@@ -1751,6 +1753,118 @@ stream_apply_truncate(StreamApplyContext *context, const char *sql)
 
 
 /*
+ * stream_apply_prepare prepares a statement as ld_transform wrote it, minus
+ * the ONLY of an UPDATE or DELETE whose relation is partitioned on the target,
+ * where ONLY matches no row.
+ */
+static bool
+stream_apply_prepare(StreamApplyContext *context, const char *name,
+					 const char *sql)
+{
+	const char *prefixes[] = { "UPDATE ONLY ", "DELETE FROM ONLY " };
+	const char only[] = "ONLY ";
+	const char subselect[] = "(SELECT tableoid, ctid FROM ONLY ";
+
+	for (int i = 0; i < 2; i++)
+	{
+		if (strncmp(sql, prefixes[i], strlen(prefixes[i])) != 0)
+		{
+			continue;
+		}
+
+		/* the text holds $n parameters only, so unquoted words are our own */
+		const char *qname = sql + strlen(prefixes[i]);
+		const char *p = qname;
+		bool inQuote = false;
+
+		for (; *p != '\0' && (inQuote || *p != ' '); p++)
+		{
+			if (*p == '"')
+			{
+				inQuote = !inQuote;
+			}
+		}
+
+		char *relation = strndup(qname, p - qname);
+		char relkind = '\0';
+
+		if (relation == NULL)
+		{
+			log_error(ALLOCATION_FAILED_ERROR);
+			return false;
+		}
+
+		/* applyPgConn is in pipeline mode, which cannot read a result here */
+		if (!pgsql_get_table_relkind(&(context->controlPgConn), relation,
+									 &relkind))
+		{
+			log_error("Failed to resolve the relkind of \"%s\" on the target",
+					  relation);
+			free(relation);
+			return false;
+		}
+
+		free(relation);
+
+		if (relkind != 'p')
+		{
+			break;
+		}
+
+		/* the ctid subselect of a table without a key names it again */
+		const char *sub = p;
+
+		for (inQuote = false; *sub != '\0'; sub++)
+		{
+			if (*sub == '"')
+			{
+				inQuote = !inQuote;
+			}
+			else if (!inQuote &&
+					 strncmp(sub, subselect, strlen(subselect)) == 0)
+			{
+				break;
+			}
+		}
+
+		PQExpBuffer buf = createPQExpBuffer();
+		int verbLen = strlen(prefixes[i]) - strlen(only);
+
+		appendPQExpBuffer(buf, "%.*s", verbLen, sql);
+
+		if (*sub == '\0')
+		{
+			appendPQExpBufferStr(buf, qname);
+		}
+		else
+		{
+			int keptLen = (sub - qname) + strlen(subselect) - strlen(only);
+
+			appendPQExpBuffer(buf, "%.*s%s",
+							  keptLen, qname,
+							  sub + strlen(subselect));
+		}
+
+		if (PQExpBufferBroken(buf))
+		{
+			log_error(ALLOCATION_FAILED_ERROR);
+			destroyPQExpBuffer(buf);
+			return false;
+		}
+
+		bool success = pgsql_prepare(&(context->applyPgConn), name, buf->data,
+									 0, NULL);
+
+		destroyPQExpBuffer(buf);
+
+		return success;
+	}
+
+	return pgsql_prepare(&(context->applyPgConn), name, sql, 0, NULL);
+}
+
+
+/*
  * stream_apply_dml applies a single DML row (INSERT/UPDATE/DELETE/TRUNCATE)
  * to the target database.  The transaction must already be open.
  *
@@ -1789,7 +1903,7 @@ stream_apply_dml(StreamApplyContext *context, ReplayDBStmt *s)
 		char name[NAMEDATALEN] = { 0 };
 		sformat(name, sizeof(name), "%x", hash);
 
-		if (!pgsql_prepare(applyPgConn, name, s->stmt, 0, NULL))
+		if (!stream_apply_prepare(context, name, s->stmt))
 		{
 			/* errors have already been logged */
 			return false;
@@ -2764,7 +2878,7 @@ stream_apply_sql(StreamApplyContext *context,
 				char name[NAMEDATALEN] = { 0 };
 				sformat(name, sizeof(name), "%x", metadata->hash);
 
-				if (!pgsql_prepare(applyPgConn, name, metadata->stmt, 0, NULL))
+				if (!stream_apply_prepare(context, name, metadata->stmt))
 				{
 					/* errors have already been logged */
 					return false;
