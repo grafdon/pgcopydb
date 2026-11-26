@@ -106,7 +106,7 @@ sqlite3 -init /dev/null -batch -noheader ${COPYDIR}/schema/source.db \
 moved=`sqlite3 -init /dev/null -batch -noheader ${COPYDIR}/schema/source.db "select count(*) from cdc_files where filename not like '${COPYDIR}/cdc/%'"`
 test "${moved}" -eq 0
 
-timeout 60 pgcopydb stream apply --target - --dir ${COPYDIR} > /tmp/apply-stdout.sql
+timeout -s KILL 60 pgcopydb stream apply --target - --dir ${COPYDIR} > /tmp/apply-stdout.sql
 
 txns=`sqlite3 -init /dev/null -batch -noheader ${OUTPUTDB} "select count(distinct xid) from output where action = 'C'"`
 begins=`grep -c '^BEGIN$' /tmp/apply-stdout.sql || true`
@@ -124,7 +124,7 @@ rm -f ${COPYDIR}/cdc/*-replay.db*
 sqlite3 -init /dev/null -batch -noheader ${COPYDIR}/cdc/$(basename ${OUTPUTDB}) \
   "delete from output where action = 'C' and xid = (select xid from output where action = 'C' order by lsn desc limit 1)"
 
-timeout 60 pgcopydb stream apply --target - --dir ${COPYDIR} > /tmp/apply-stdout-open.sql
+timeout -s KILL 60 pgcopydb stream apply --target - --dir ${COPYDIR} > /tmp/apply-stdout-open.sql
 
 commits=`grep -c '^COMMIT$' /tmp/apply-stdout-open.sql || true`
 test "${commits}" -eq $((txns - 1))
