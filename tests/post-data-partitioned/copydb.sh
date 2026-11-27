@@ -60,3 +60,48 @@ if grep -q 'Restoring post-data in 3 passes' "${TMPDIR}/serial.log"; then
 fi
 check_target serial
 echo "PASS [serial]: --restore-jobs 1 keeps a single post-data pass"
+
+# A run that stops during post-data leaves part of it on the target. Here the
+# foreign keys of pass 3 are missing. The next run must skip the objects that
+# exist, which fail with "already exists", or with --drop-if-exists with
+# "cannot drop inherited constraint", and it must write the --use-list file
+# again rather than append to it.
+fkeys="select count(*) from pg_constraint
+        where contype = 'f' and connamespace = 'app'::regnamespace"
+
+drop_fkeys() {
+    target_sql "select format('alter table %s drop constraint %I;',
+                              conrelid::regclass, conname)
+                  from pg_constraint
+                 where contype = 'f' and conparentid = 0
+                   and connamespace = 'app'::regnamespace" \
+        | psql -qX -v ON_ERROR_STOP=1 -d "${PGCOPYDB_TARGET_PGURI}"
+    equal "$(target_sql "${fkeys}")" 0 "foreign keys dropped on the target"
+
+    # and the run did not record post-data as done
+    sqlite3 -init /dev/null -batch "${TMPDIR}/retry/schema/source.db" \
+        "update timings set done_time_epoch = 0 where label = 'Finalize Schema'"
+}
+
+clone retry --restore-jobs 8
+list="${TMPDIR}/retry/schema/post-filtered.list"
+entries=$(wc -l < "${list}")
+source_fkeys=$(source_sql "${fkeys}")
+
+for opts in "" "--drop-if-exists"; do
+    name="retry${opts:+ ${opts}}"
+    drop_fkeys
+    # the snapshot of the clone is gone, as it is on a real rerun
+    pgcopydb restore post-data --dir "${TMPDIR}/retry" --resume --not-consistent \
+        --restore-jobs 8 ${opts} > "${TMPDIR}/retry.log" 2>&1 \
+        || { grep -E 'ERROR' "${TMPDIR}/retry.log" | head -20 >&2;
+             fail "${name}: post-data exited with an error"; }
+    grep -q 'post-data objects that already exist on the target' \
+        "${TMPDIR}/retry.log" \
+        || { tail -20 "${TMPDIR}/retry.log" >&2;
+             fail "${name}: no existing object was skipped"; }
+    equal "$(wc -l < "${list}")" "${entries}" "${name}: lines in ${list}"
+    equal "$(target_sql "${fkeys}")" "${source_fkeys}" "${name}: foreign keys"
+    check_target "${name}"
+    echo "PASS [${name}]: post-data resumed after a partial restore"
+done
